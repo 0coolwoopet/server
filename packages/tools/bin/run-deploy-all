@@ -201,6 +201,31 @@ bootstrap() {
 				--value "${ts_val:-placeholder-not-configured}" >/dev/null
 		fi
 	done
+	# match's Photon app ids are Secrets Store bindings (they must exist or its deploy fails).
+	# Missing ones are created from RECFLARE_PHOTON_*_APP_ID, or as a placeholder that match
+	# reads as "no app". A value in the build is UPDATED into an existing entry on every
+	# deploy, so changing the build variable is how you change the id; with none set, an
+	# existing entry is left alone (so one set by hand in the dashboard survives).
+	for ph in PHOTON_REALTIME_APP_ID PHOTON_VOICE_APP_ID PHOTON_CHAT_APP_ID; do
+		ph_val=$(printenv "RECFLARE_$ph" || true)
+		if ! printf '%s\n' "$existing_secrets" | grep -q "$ph"; then
+			echo "Creating $ph (placeholder unless RECFLARE_$ph is set; the client gets no Photon app without the real id)"
+			wr secrets-store secret create "$RECFLARE_SECRETS_STORE" --name "$ph" --scopes workers --remote \
+				--value "${ph_val:-placeholder-not-configured}" >/dev/null
+		elif [ -n "$ph_val" ]; then
+			echo "Updating $ph"
+			secret_id=$(printf '%s\n' "$existing_secrets" | grep "$ph" \
+				| grep -oE '[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f-]{27}' | head -1)
+			if [ -n "$secret_id" ] && wr secrets-store secret update "$RECFLARE_SECRETS_STORE" --secret-id "$secret_id" \
+				--value "$ph_val" --scopes workers --remote >/dev/null 2>&1; then
+				:
+			else
+				[ -n "$secret_id" ] && wr secrets-store secret delete "$RECFLARE_SECRETS_STORE" --secret-id "$secret_id" --remote >/dev/null 2>&1 || true
+				wr secrets-store secret create "$RECFLARE_SECRETS_STORE" --name "$ph" --scopes workers --remote \
+					--value "$ph_val" >/dev/null
+			fi
+		fi
+	done
 	if ! printf '%s\n' "$existing_secrets" | grep -q 'META_APP_SECRET'; then
 		echo "Creating META_APP_SECRET (placeholder unless META_APP_SECRET is set; Meta sign-in needs the real one)"
 		wr secrets-store secret create "$RECFLARE_SECRETS_STORE" --name META_APP_SECRET --scopes workers --remote \

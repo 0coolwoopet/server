@@ -13,7 +13,7 @@
 
 # Names the deploy scripts consume themselves — the domain and the ids of the operator's
 # Cloudflare resources. Everything else in .env is worker config; see recflare_vars.
-RECFLARE_RESERVED="DOMAIN SUBDOMAINS D1 KV SECRETS_STORE ENV_LOADED STAFF_ACCOUNT_IDS RELOAD_CATALOG LOAD_CATALOG"
+RECFLARE_RESERVED="DOMAIN SUBDOMAINS D1 KV SECRETS_STORE ENV_LOADED STAFF_ACCOUNT_IDS RELOAD_CATALOG LOAD_CATALOG PHOTON_REALTIME_APP_ID PHOTON_VOICE_APP_ID PHOTON_CHAT_APP_ID"
 
 # Load the root .env, letting anything already in the environment win. The file is a local
 # convenience; CI exports the same names as secrets and must not be clobbered by a stray

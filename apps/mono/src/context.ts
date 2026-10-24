@@ -20,6 +20,11 @@ export type Env = SharedHonoEnv & {
 	// Meta (Oculus) app secret, from the same store. Read only by `auth`, to validate a
 	// headset login's nonce with Meta (see apps/auth/src/meta-nonce.ts).
 	META_APP_SECRET: SecretsStoreSecret
+	// Photon application ids, from the same store. Read only by `match`, for
+	// GET /player/connection-info.
+	PHOTON_REALTIME_APP_ID: SecretsStoreSecret
+	PHOTON_VOICE_APP_ID: SecretsStoreSecret
+	PHOTON_CHAT_APP_ID: SecretsStoreSecret
 	// Shared `recflare` database (accounts, auth, api, clubs, match, rooms, …).
 	DB: D1Database
 	// Image storage bucket (api, img).

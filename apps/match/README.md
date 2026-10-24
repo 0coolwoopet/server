@@ -124,6 +124,9 @@ substitutes the same as asking by id.
 | -------------------------- | ------------- | ------------------------------------------------------------ |
 | `DB`                       | D1            | Shared `recflare` database — rooms, room instances, presence |
 | `JWT_SECRET`               | Secrets Store | Shared HS256 signing key (see the `auth` README)             |
+| `PHOTON_REALTIME_APP_ID`   | Secrets Store | Photon Realtime app id handed to the client                  |
+| `PHOTON_VOICE_APP_ID`      | Secrets Store | Photon Voice app id                                          |
+| `PHOTON_CHAT_APP_ID`       | Secrets Store | Photon Chat app id                                           |
 | `RECFLARE_PLAYER_SETTINGS` | KV            | The `playersettings` map — `/player/avoidjuniors`            |
 
 The `presence` and `room_instance` tables are owned/migrated by the `rooms` worker. This

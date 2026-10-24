@@ -151,27 +151,59 @@ function varOr(value: string | undefined, fallback: string): string {
 }
 
 /**
- * The Photon credentials `GET /player/connection-info` hands out, from the operator's vars.
+ * The Photon credentials `GET /player/connection-info` hands out, from the operator's
+ * Secrets Store bindings (`PHOTON_REALTIME_APP_ID`, `PHOTON_VOICE_APP_ID`,
+ * `PHOTON_CHAT_APP_ID`).
  *
  * The app ids default to EMPTY — this repo ships no Photon application of its own, and
  * baking somebody else's ids in would silently point every player at an app the operator
- * doesn't control. A deployment that wants working voice and networking sets all three
- * (`PHOTON_REALTIME_APP_ID`, `PHOTON_VOICE_APP_ID`, `PHOTON_CHAT_APP_ID`); until then the
- * client is handed empty ids and connects to nothing, which is the honest answer for a
- * server with no Photon apps configured. They are not secrets — the client receives all
- * three in the clear — so they are plain vars rather than Secrets Store entries.
+ * doesn't control. A deployment that wants working voice and networking puts all three in
+ * the Secrets Store; until then the client is handed empty ids and connects to nothing,
+ * which is the honest answer for a server with no Photon apps configured. A binding whose
+ * store entry is missing, unreadable, blank or still the deploy's placeholder reads as
+ * empty rather than failing the request.
  *
- * `photonRegion` is the exception, and is ALSO stamped on every room instance
+ * `photonRegion` stays a plain var, and is ALSO stamped on every room instance
  * ({@link instancePhotonRegion}): the two must not disagree, since the client connects to
  * the region on its instance and authenticates against the app named here. One var feeds
  * both for that reason.
  */
-function photonApps(env: Env) {
+async function photonApps(env: Env) {
+	const [photonRealtimeAppId, photonVoiceAppId, photonChatAppId] = await Promise.all([
+		readPhotonSecret(env.PHOTON_REALTIME_APP_ID, 'PHOTON_REALTIME_APP_ID'),
+		readPhotonSecret(env.PHOTON_VOICE_APP_ID, 'PHOTON_VOICE_APP_ID'),
+		readPhotonSecret(env.PHOTON_CHAT_APP_ID, 'PHOTON_CHAT_APP_ID'),
+	])
 	return {
-		photonRealtimeAppId: varOr(env.PHOTON_REALTIME_APP_ID, ''),
-		photonVoiceAppId: varOr(env.PHOTON_VOICE_APP_ID, ''),
-		photonChatAppId: varOr(env.PHOTON_CHAT_APP_ID, ''),
+		photonRealtimeAppId,
+		photonVoiceAppId,
+		photonChatAppId,
 		photonRegion: instancePhotonRegion(env),
+	}
+}
+
+/** What the deploy script stores for a Photon id the operator hasn't supplied. */
+const PHOTON_SECRET_PLACEHOLDER = 'placeholder-not-configured'
+
+/**
+ * One Photon app id from its Secrets Store binding, or '' when it isn't usable. The binding
+ * is declared in wrangler.jsonc so it's always on `env`; what varies is whether the store
+ * holds a real value, so a throw, a blank, or the deploy's placeholder all read as unset.
+ */
+async function readPhotonSecret(
+	secret: SecretsStoreSecret | undefined,
+	name: string
+): Promise<string> {
+	if (!secret) return ''
+	try {
+		const value = ((await secret.get()) ?? '').trim()
+		return value === PHOTON_SECRET_PLACEHOLDER ? '' : value
+	} catch (err) {
+		logger.error('failed to read a photon app id from the secrets store', {
+			secret: name,
+			error: String(err),
+		})
+		return ''
 	}
 }
 
@@ -3260,7 +3292,7 @@ const app = new Hono<App>()
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 
-			const apps = photonApps(c.env)
+			const apps = await photonApps(c.env)
 			const presence = await getPresence<RoomInstance>(c.env.DB, id)
 			// Presence first (it's the instance the player is actually in); the query param
 			// only stands in when there's no live presence to read. The instance id travels

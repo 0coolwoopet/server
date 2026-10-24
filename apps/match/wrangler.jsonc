@@ -46,6 +46,25 @@
 			"binding": "JWT_SECRET",
 			"store_id": "local",
 			"secret_name": "JWT_SECRET"
+		},
+		// The Photon application ids handed to the client by GET /player/connection-info.
+		// Like JWT_SECRET these must EXIST in the store or the deploy fails; the deploy
+		// script creates any that are missing (a placeholder, which reads as "no app")
+		// and fills them from RECFLARE_PHOTON_*_APP_ID when those are set.
+		{
+			"binding": "PHOTON_REALTIME_APP_ID",
+			"store_id": "local",
+			"secret_name": "PHOTON_REALTIME_APP_ID"
+		},
+		{
+			"binding": "PHOTON_VOICE_APP_ID",
+			"store_id": "local",
+			"secret_name": "PHOTON_VOICE_APP_ID"
+		},
+		{
+			"binding": "PHOTON_CHAT_APP_ID",
+			"store_id": "local",
+			"secret_name": "PHOTON_CHAT_APP_ID"
 		}
 	],
 	// The `notify` worker's NotificationsHub DO — used by POST /invite to push the
@@ -63,9 +82,8 @@
 	"observability": {
 		"enabled": false
 	},
-	// The operator's knobs — the room substitutions (ROOM_REDIRECTS), the Photon app ids
-	// and region (PHOTON_REALTIME_APP_ID, PHOTON_VOICE_APP_ID, PHOTON_CHAT_APP_ID,
-	// PHOTON_REGION), and the Tachyon server pools (TACHYON_HOST_PORT,
+	// The operator's knobs — the room substitutions (ROOM_REDIRECTS), the Photon region
+	// (PHOTON_REGION), and the Tachyon server pools (TACHYON_HOST_PORT,
 	// TACHYON_HOST_PORT_SANDBOX) —
 	// are deliberately NOT set here. They're injected at deploy time from
 	// the gitignored .env (RECFLARE_<VAR>, see .env.example), so swapping a room out or

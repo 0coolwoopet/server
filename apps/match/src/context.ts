@@ -44,14 +44,15 @@ export type Env = SharedHonoEnv & {
 	 * this repo ships no Photon application, so a deployment that wants working networking
 	 * has to name its own.
 	 *
-	 * Not a secret — the client is handed all three ids in the clear — so these are plain
-	 * vars rather than Secrets Store entries.
+	 * Secrets Store bindings (resolve with `.get()`, via `photonApps` in match.app.ts). The
+	 * deploy creates the entries when missing — as a placeholder, which reads as empty —
+	 * and fills them from `RECFLARE_PHOTON_*_APP_ID` when those are set.
 	 */
-	PHOTON_REALTIME_APP_ID?: string
-	/** The Photon Voice application id. Optional; see {@link Env.PHOTON_REALTIME_APP_ID}. */
-	PHOTON_VOICE_APP_ID?: string
-	/** The Photon Chat application id. Optional; see {@link Env.PHOTON_REALTIME_APP_ID}. */
-	PHOTON_CHAT_APP_ID?: string
+	PHOTON_REALTIME_APP_ID: SecretsStoreSecret
+	/** The Photon Voice application id. See {@link Env.PHOTON_REALTIME_APP_ID}. */
+	PHOTON_VOICE_APP_ID: SecretsStoreSecret
+	/** The Photon Chat application id. See {@link Env.PHOTON_REALTIME_APP_ID}. */
+	PHOTON_CHAT_APP_ID: SecretsStoreSecret
 	/**
 	 * The pool of Tachyon servers sessions are spread across — a COMMA-SEPARATED list of
 	 * `host:port` entries (e.g. `66.228.47.217:7777,66.228.47.217:7778,45.79.2.10:7777`).

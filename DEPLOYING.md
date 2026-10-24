@@ -261,9 +261,9 @@ edit the value, then re-deploy the worker that reads them.
 | `RECFLARE_STARTING_TOKENS`              | `econ`    | `10000`    | RecCenterTokens a new player is granted.                       |
 | `RECFLARE_MAX_UPLOAD_BYTES`             | `storage` | `67108864` | Maximum binary upload size; larger files receive HTTP 413.     |
 | `RECFLARE_ROOM_REDIRECTS`               | `match`   | unset      | Rooms to switch out on matchmake, e.g. `2=MyHub`.              |
-| `RECFLARE_PHOTON_REALTIME_APP_ID`       | `match`   | empty      | Your Photon Realtime app id. No app ships with recflare.       |
-| `RECFLARE_PHOTON_VOICE_APP_ID`          | `match`   | empty      | Your Photon Voice app id.                                      |
-| `RECFLARE_PHOTON_CHAT_APP_ID`           | `match`   | empty      | Your Photon Chat app id.                                       |
+| `RECFLARE_PHOTON_REALTIME_APP_ID`       | `match`   | empty      | Your Photon Realtime app id. Copied into the Secrets Store.    |
+| `RECFLARE_PHOTON_VOICE_APP_ID`          | `match`   | empty      | Your Photon Voice app id. Copied into the Secrets Store.       |
+| `RECFLARE_PHOTON_CHAT_APP_ID`           | `match`   | empty      | Your Photon Chat app id. Copied into the Secrets Store.        |
 | `RECFLARE_PHOTON_REGION`                | `match`   | `us`       | Photon region every session is pinned to.                      |
 
 Then deploy just the worker that reads it:
@@ -289,6 +289,13 @@ Both account caps are enforced on signup only, never on login — an existing ac
 stays reachable no matter how many its owner has accumulated. The per-IP cap is the coarse
 one: households, NAT and shared campus/mobile networks put many legitimate players behind a
 single address, so raise it (or set it to `0`) if real players report being locked out.
+
+> **The Photon app ids are the exception to "knobs become vars".** `match` reads them from
+> Secrets Store entries named `PHOTON_REALTIME_APP_ID`, `PHOTON_VOICE_APP_ID` and
+> `PHOTON_CHAT_APP_ID`. The deploy creates them if missing (a placeholder, read as "no app")
+> and, when the `RECFLARE_PHOTON_*_APP_ID` values above are set, writes them into the store
+> on every deploy. Change one by hand in the dashboard instead and leave the variable unset.
+> Store values are cached per worker isolate, so redeploy `match` after changing one.
 
 > **Don't set these as Worker variables in the Cloudflare dashboard.** A deploy replaces a
 > worker's variables wholesale, so a dashboard-set value is wiped by your next

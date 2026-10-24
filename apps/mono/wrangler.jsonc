@@ -65,6 +65,22 @@
 			"binding": "META_APP_SECRET",
 			"store_id": "local",
 			"secret_name": "META_APP_SECRET"
+		},
+		// The Photon app ids the mounted `match` app hands the client (see apps/match).
+		{
+			"binding": "PHOTON_REALTIME_APP_ID",
+			"store_id": "local",
+			"secret_name": "PHOTON_REALTIME_APP_ID"
+		},
+		{
+			"binding": "PHOTON_VOICE_APP_ID",
+			"store_id": "local",
+			"secret_name": "PHOTON_VOICE_APP_ID"
+		},
+		{
+			"binding": "PHOTON_CHAT_APP_ID",
+			"store_id": "local",
+			"secret_name": "PHOTON_CHAT_APP_ID"
 		}
 	],
 	"upload_source_maps": true,

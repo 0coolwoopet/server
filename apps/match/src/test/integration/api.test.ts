@@ -1618,7 +1618,10 @@ describe('auth-gated endpoints', () => {
 		})
 	})
 
-	test('the Photon apps and region come from the operator’s vars', async () => {
+	const fakeSecret = (value: string): SecretsStoreSecret =>
+		({ get: async () => value }) as SecretsStoreSecret
+
+	test('the Photon apps come from Secrets Store bindings and the region from a var', async () => {
 		// Unset, every value is the shipped default — asserted by the test above. Set, the
 		// vars win, and the region has to reach BOTH the connection info and the instance:
 		// the client authenticates against the app named here and connects to the region on
@@ -1630,9 +1633,9 @@ describe('auth-gated endpoints', () => {
 			region: env.PHOTON_REGION,
 		}
 		try {
-			env.PHOTON_REALTIME_APP_ID = '11111111-1111-4111-8111-111111111111'
-			env.PHOTON_VOICE_APP_ID = '22222222-2222-4222-8222-222222222222'
-			env.PHOTON_CHAT_APP_ID = '33333333-3333-4333-8333-333333333333'
+			env.PHOTON_REALTIME_APP_ID = fakeSecret('11111111-1111-4111-8111-111111111111')
+			env.PHOTON_VOICE_APP_ID = fakeSecret('22222222-2222-4222-8222-222222222222')
+			env.PHOTON_CHAT_APP_ID = fakeSecret('33333333-3333-4333-8333-333333333333')
 			env.PHOTON_REGION = 'eu'
 
 			const matchmaked = (await (
@@ -1655,15 +1658,28 @@ describe('auth-gated endpoints', () => {
 				},
 			})
 
-			// A whitespace-only var is not a value: the app id reads as unset (empty) rather
+			// A whitespace-only secret is not a value: the app id reads as unset (empty) rather
 			// than as a blank-but-present id, and the region falls back to its default.
-			env.PHOTON_REALTIME_APP_ID = '   '
+			env.PHOTON_REALTIME_APP_ID = fakeSecret('   ')
 			env.PHOTON_REGION = '  '
 			const blank = await exports.default.fetch(`${ORIGIN}/player/connection-info`, {
 				headers: await bearer('961'),
 			})
 			expect((await blank.json()) as { value: Record<string, unknown> }).toMatchObject({
 				value: { photonRealtimeAppId: '', photonRegion: 'us' },
+			})
+
+			// The deploy's placeholder, and a binding that throws (entry missing from the
+			// store), both read as "no app" instead of failing the request.
+			env.PHOTON_REALTIME_APP_ID = fakeSecret('placeholder-not-configured')
+			env.PHOTON_VOICE_APP_ID = {
+				get: () => Promise.reject(new Error('no such secret')),
+			} as SecretsStoreSecret
+			const unusable = await exports.default.fetch(`${ORIGIN}/player/connection-info`, {
+				headers: await bearer('961'),
+			})
+			expect((await unusable.json()) as { value: Record<string, unknown> }).toMatchObject({
+				value: { photonRealtimeAppId: '', photonVoiceAppId: '' },
 			})
 		} finally {
 			env.PHOTON_REALTIME_APP_ID = original.realtime

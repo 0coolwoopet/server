@@ -1829,6 +1829,47 @@ export async function editUserHandler(c: Context<App>) {
 		}
 	}
 
+	// Push the edit to the game live, so nobody has to restart. A rename or display name is the
+	// same pair of frames the accounts worker sends after a profile change (owner + everyone);
+	// a flag change (developer, moderator, studio, plus...) is baked into the player's token,
+	// so `RefreshLogin` makes their client sign in again and pick the new roles up.
+	const profileChanged = changes.username !== undefined || changes.displayName !== undefined
+	const flagChanged = EDITABLE_FLAGS.some((flag) => changes[flag] !== undefined)
+	if (profileChanged || flagChanged) {
+		try {
+			const hub = c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE)
+			if (profileChanged) {
+				const publicDto = {
+					accountId: updated.accountId,
+					username: updated.username,
+					displayName: updated.displayName,
+					profileImage: updated.profileImage,
+					bannerImage: updated.bannerImage ?? '',
+					displayEmoji: updated.displayEmoji ?? '',
+					isJunior: updated.isJunior,
+					platforms: updated.platforms,
+					personalPronouns: updated.personalPronouns,
+					identityFlags: updated.identityFlags,
+					createdAt: updated.createdAt,
+				}
+				await hub.notifyPlayer(playerId, NotificationType.SubscriptionUpdateSelfProfile, {
+					...publicDto,
+					email: updated.email ?? '',
+					birthday: '1904-01-01T00:00:00.000Z',
+					availableUsernameChanges: updated.availableUsernameChanges ?? DEFAULT_USERNAME_CHANGES,
+				})
+				await hub.notifyPlayer(playerId, NotificationType.SubscriptionUpdateProfile, publicDto)
+				await hub.broadcast(NotificationType.SubscriptionUpdateProfile, publicDto)
+			}
+			if (flagChanged) await hub.notifyPlayer(playerId, NotificationType.RefreshLogin)
+		} catch (err) {
+			logger.error('failed to push a staff account edit', {
+				playerId,
+				error: err instanceof Error ? err.message : String(err),
+			})
+		}
+	}
+
 	if (Object.keys(changes).length > 0) {
 		await recordPlayerAudit(c, 'edit_user', {
 			playerId,

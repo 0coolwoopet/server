@@ -10,6 +10,7 @@ import {
 	autocompleteRoomSearch,
 	bakedUnityAssets,
 	banPlayerFromRoom,
+	ALL_ROOMS_ADMIN_ACCOUNT_IDS,
 	canManageRoom,
 	canManageRoomById,
 	cloneRoom,
@@ -293,6 +294,7 @@ const buildsByDefault = (role: number): boolean => role >= Role.CoOwner
  * tier `Roles` names them at, otherwise None — a visitor.
  */
 function roleIn(room: Room, accountId: number): number {
+	if (ALL_ROOMS_ADMIN_ACCOUNT_IDS.has(accountId)) return Role.Creator
 	if (room.CreatorAccountId === accountId) return Role.Creator
 	return roomRoles(room)
 		.filter((r) => r.AccountId === accountId)
@@ -429,7 +431,11 @@ async function handlePhotonAccessToken(c: Context<App>) {
 	const instance = (await getPresence<PresenceView>(c.env.DB, accountId))?.roomInstance
 	const room =
 		typeof instance?.roomId === 'number' ? await getRoomById(c.env.DB, instance.roomId) : null
-	const role = room ? roleIn(room, accountId) : Role.None
+	const role = ALL_ROOMS_ADMIN_ACCOUNT_IDS.has(accountId)
+		? Role.Creator
+		: room
+			? roleIn(room, accountId)
+			: Role.None
 	const overrides =
 		typeof instance?.subRoomId === 'number'
 			? await getSubRoomPermissions(c.env.DB, instance.subRoomId)

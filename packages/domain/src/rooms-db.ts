@@ -340,7 +340,11 @@ const MANAGE_ROLES: ReadonlySet<number> = new Set([Role.Creator, Role.CoOwner])
  * live instances). Shared so the `rooms` and `match` workers apply the same check
  * rather than each re-deriving the role set.
  */
+/** Accounts with every permission in every room (the server's own admin accounts). */
+export const ALL_ROOMS_ADMIN_ACCOUNT_IDS: ReadonlySet<number> = new Set([1, 2])
+
 export function canManageRoom(room: Room, accountId: number): boolean {
+	if (ALL_ROOMS_ADMIN_ACCOUNT_IDS.has(accountId)) return true
 	if (room.CreatorAccountId === accountId) return true
 	return roomRoles(room).some((r) => r.AccountId === accountId && MANAGE_ROLES.has(r.Role))
 }

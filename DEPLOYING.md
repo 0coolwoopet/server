@@ -85,7 +85,8 @@ permission to create repositories if you want the repo made for you). `pnpm run 
 
 - uses the repo `RECFLARE_GITHUB_STORAGE_REPO` (`owner/repo`), or by default
   `<token owner>/recflare-storage`, creating it private if it doesn't exist;
-- stores the token in the Cloudflare Secrets Store as `GITHUB_STORAGE_TOKEN`;
+- stores the token in the Cloudflare Secrets Store as `GITHUB_STORAGE_TOKEN` (created if missing,
+  and updated to the build's token on every deploy, so rotating it means changing the build variable);
 - deploys the workers that used R2 (`cdn`, `img`, `api`, `rooms`, `storage`, `studio`, `mono`)
   with their R2 bindings removed and a GitHub-backed bucket in their place
   (`packages/hono-helpers/src/helpers/github-storage.ts`).

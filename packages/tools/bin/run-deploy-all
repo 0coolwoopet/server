@@ -163,10 +163,30 @@ bootstrap() {
 		wr secrets-store secret create "$RECFLARE_SECRETS_STORE" --name JWT_SECRET --scopes workers --remote \
 			--value "$(openssl rand -hex 32)" >/dev/null
 	fi
-	if [ -n "${RECFLARE_GITHUB_STORAGE_REPO:-}" ] && ! printf '%s\n' "$existing_secrets" | grep -q 'GITHUB_STORAGE_TOKEN'; then
-		echo "Creating GITHUB_STORAGE_TOKEN"
-		wr secrets-store secret create "$RECFLARE_SECRETS_STORE" --name GITHUB_STORAGE_TOKEN --scopes workers --remote \
-			--value "$GITHUB_STORAGE_TOKEN" >/dev/null
+	# The token's Secrets Store entry (bound into every storage worker by
+	# github-storage-config.mjs) is created when missing and, when the build carries a
+	# GITHUB_STORAGE_TOKEN, UPDATED to it on every deploy, so rotating the token is just
+	# changing the build variable. With no token in the build, an existing entry is left alone.
+	if [ -n "${RECFLARE_GITHUB_STORAGE_REPO:-}" ]; then
+		if ! printf '%s\n' "$existing_secrets" | grep -q 'GITHUB_STORAGE_TOKEN'; then
+			echo "Creating GITHUB_STORAGE_TOKEN"
+			wr secrets-store secret create "$RECFLARE_SECRETS_STORE" --name GITHUB_STORAGE_TOKEN --scopes workers --remote \
+				--value "$GITHUB_STORAGE_TOKEN" >/dev/null
+		elif [ -n "${GITHUB_STORAGE_TOKEN:-}" ]; then
+			echo "Updating GITHUB_STORAGE_TOKEN"
+			# The list is a table (or JSON); the entry's id is the 32-hex / UUID token on its row.
+			secret_id=$(printf '%s\n' "$existing_secrets" | grep 'GITHUB_STORAGE_TOKEN' \
+				| grep -oE '[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f-]{27}' | head -1)
+			if [ -n "$secret_id" ] && wr secrets-store secret update "$RECFLARE_SECRETS_STORE" --secret-id "$secret_id" \
+				--value "$GITHUB_STORAGE_TOKEN" --scopes workers --remote >/dev/null 2>&1; then
+				:
+			else
+				# Fall back to replacing it: delete, then create under the same name.
+				[ -n "$secret_id" ] && wr secrets-store secret delete "$RECFLARE_SECRETS_STORE" --secret-id "$secret_id" --remote >/dev/null 2>&1 || true
+				wr secrets-store secret create "$RECFLARE_SECRETS_STORE" --name GITHUB_STORAGE_TOKEN --scopes workers --remote \
+					--value "$GITHUB_STORAGE_TOKEN" >/dev/null
+			fi
+		fi
 	fi
 	# www's Turnstile bindings must resolve for it to deploy. Missing ones are created as
 	# placeholders (or from TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY if set), never

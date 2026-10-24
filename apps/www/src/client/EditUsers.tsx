@@ -377,18 +377,24 @@ function UserEditor({
 			<section className="card">
 				<h2>Give all items and skins</h2>
 				<p className="hint">
-					Unlocks every avatar item and skin in the catalog for @{user.username}, each one
-					delivered as a gift box. Pressing it again sends a fresh set of boxes.
+					Unlocks everything the item catalog lists for @{user.username} — avatar items, skins
+					and the store&apos;s custom items — each one delivered as its own gift box. Pressing
+					it again sends a fresh set of boxes.
 				</p>
 				<form
 					onSubmit={(e) => {
 						e.preventDefault()
 						void allItems.run(async () => {
-							const res = await call<{ items: number; skins: number; boxes: number }>(
+							const res = await call<{
+								items: number
+								skins: number
+								customItems: number
+								boxes: number
+							}>(
 								`/api/staff/players/${user.accountId}/give-all-items`,
 								{ authed: true, json: {} }
 							)
-							return `Gave @${user.username} ${res.items.toLocaleString()} items and ${res.skins.toLocaleString()} skins as ${res.boxes.toLocaleString()} gift boxes.`
+							return `Gave @${user.username} ${res.items.toLocaleString()} items, ${res.skins.toLocaleString()} skins and ${res.customItems.toLocaleString()} custom items as ${res.boxes.toLocaleString()} gift boxes.`
 						})
 					}}
 				>

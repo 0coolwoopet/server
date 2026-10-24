@@ -638,6 +638,9 @@ const MAX_GIFT_MESSAGE = 256
  */
 const GIFT_CONTEXT_PURCHASED_GIFT_A = 500
 
+/** How many gift-box frames one hub RPC carries when give-all announces its boxes. */
+const GIVE_ALL_FRAMES_PER_CALL = 500
+
 /** The message on the box a staff gift comes in. */
 const STAFF_GIFT_MESSAGE = 'A gift from the staff!'
 
@@ -1330,9 +1333,12 @@ async function findGiftableItem(db: D1Database, requested: string): Promise<Gift
 }
 
 /**
- * Give a player EVERY avatar item and skin in the catalog: written into their inventory,
- * the same rows a purchase makes, plus one gift box per item and skin. Owned items are
- * refreshed, not doubled, but every press adds a fresh set of boxes.
+ * Give a player EVERYTHING the item catalog lists: every avatar item and skin, and every
+ * first-party custom avatar item the store sells, written into their inventory (the same rows
+ * a purchase makes) plus one gift box each. Nothing is listed in code: the rows are read from
+ * the `catalog` table at the moment of the press, and a custom item is only given when its
+ * record exists in `custom_avatar_item`. Owned items are refreshed, not doubled, but every
+ * press adds a fresh set of boxes — and EVERY box is announced to the player, not just one.
  * Needs the `catalog` table loaded (the deploy does that when it is empty).
  */
 export async function giveAllItemsHandler(c: Context<App>) {
@@ -1347,7 +1353,29 @@ export async function giveAllItemsHandler(c: Context<App>) {
 	)
 		.bind(CatalogKind.AvatarItem, CatalogKind.Skin)
 		.all<CatalogRow>()
-	if (results.length === 0) {
+
+	// The first-party custom items the store lists. The catalog row only carries the listing;
+	// the item itself is `api`'s `custom_avatar_item` record, so the join keeps out a listing
+	// whose item was never loaded (its box would not open). The match is exact, which is what
+	// the store's own lookups do and lets the unique index answer it.
+	let customIds: string[] = []
+	try {
+		const { results: custom } = await c.env.DB.prepare(
+			`SELECT c.item_key AS id FROM catalog c
+			 JOIN custom_avatar_item i ON i.custom_avatar_item_id = c.item_key
+			 WHERE c.kind = ?1
+			 ORDER BY c.item_key`
+		)
+			.bind(CatalogKind.CustomAvatarItem)
+			.all<{ id: string }>()
+		customIds = custom.map((r) => r.id)
+	} catch (err) {
+		logger.error('give-all could not read the custom avatar items', {
+			playerId,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+	if (results.length === 0 && customIds.length === 0) {
 		return c.json(
 			{ error: 'The item catalog is empty. Redeploy once so the deploy can load it.' },
 			409
@@ -1358,6 +1386,7 @@ export async function giveAllItemsHandler(c: Context<App>) {
 	const gifts: GiftContent[] = []
 	let items = 0
 	let skins = 0
+	let customItems = 0
 	for (const row of results) {
 		if (row.kind === CatalogKind.AvatarItem) {
 			const item = toCatalogAvatarItem(row)
@@ -1409,8 +1438,27 @@ export async function giveAllItemsHandler(c: Context<App>) {
 			skins++
 		}
 	}
-	// One gift box per item and skin, in the same batches, so the player gets the usual box
-	// for each. (Pressing this again adds another box per item.)
+	// Custom items: ownership is a row in `inventory_custom`; the box names the item by
+	// `CustomAvatarItemId`, with `AvatarItemType` 0 as giftCustomItem's box carries.
+	const acquiredAt = new Date().toISOString()
+	for (const id of customIds) {
+		statements.push(
+			c.env.DB.prepare(
+				'INSERT OR IGNORE INTO inventory_custom (account_id, custom_avatar_item_id, acquired_at) VALUES (?1, ?2, ?3)'
+			).bind(playerId, id, acquiredAt)
+		)
+		gifts.push(
+			staffGiftContent({
+				GiftContext: GIFT_CONTEXT_PURCHASED_GIFT_A,
+				CustomAvatarItemId: id,
+				AvatarItemType: 0,
+			})
+		)
+		customItems++
+	}
+
+	// One gift box per item, skin and custom item, in the same batches, so the player gets the
+	// usual box for each. (Pressing this again adds another box per item.)
 	const createdAt = new Date().toISOString()
 	for (const content of gifts) {
 		statements.push(
@@ -1423,18 +1471,50 @@ export async function giveAllItemsHandler(c: Context<App>) {
 		await c.env.DB.batch(statements.slice(i, i + 100))
 	}
 
-	// Show the player one of the boxes now, if they are online, rather than thousands of
-	// frames; the rest are there when they open their gifts.
-	const last = await c.env.DB.prepare(
-		'SELECT id, data FROM received_gift WHERE account_id = ?1 ORDER BY id DESC LIMIT 1'
+	// Announce EVERY box just made, not one: each is its own `GiftPackageReceivedImmediate`
+	// frame carrying its own id. They go through the hub's bulk send, a chunk per RPC, so the
+	// request stays inside its subrequest budget. A player who is offline has them queued (the
+	// hub keeps the newest few hundred) and still finds every box in `GET /api/avatar/v2/gifts`.
+	const { results: made } = await c.env.DB.prepare(
+		'SELECT id, data FROM received_gift WHERE account_id = ?1 AND created_at = ?2 ORDER BY id'
 	)
-		.bind(playerId)
-		.first<{ id: number; data: string }>()
-	if (last !== null) await announceGift(c, playerId, last.id, JSON.parse(last.data) as GiftContent)
+		.bind(playerId, createdAt)
+		.all<{ id: number; data: string }>()
+	const frames: PlayerNotification[] = made.map((g) => ({
+		playerId,
+		notificationType: NotificationType.GiftPackageReceivedImmediate,
+		data: { ...giftFrame(g.id, JSON.parse(g.data) as GiftContent) },
+	}))
+	const hub = c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE)
+	for (let i = 0; i < frames.length; i += GIVE_ALL_FRAMES_PER_CALL) {
+		try {
+			await hub.notifyPlayers(frames.slice(i, i + GIVE_ALL_FRAMES_PER_CALL))
+		} catch (err) {
+			logger.error('failed to announce the give-all gift boxes', {
+				playerId,
+				announced: i,
+				boxes: frames.length,
+				error: err instanceof Error ? err.message : String(err),
+			})
+			break
+		}
+	}
 
-	await recordPlayerAudit(c, 'give_all_items', { playerId, items, skins, boxes: gifts.length })
-	logger.info('staff gave every item and skin', { moderatorId: staffId(c), playerId, items, skins })
-	return c.json({ items, skins, boxes: gifts.length })
+	await recordPlayerAudit(c, 'give_all_items', {
+		playerId,
+		items,
+		skins,
+		customItems,
+		boxes: gifts.length,
+	})
+	logger.info('staff gave every item and skin', {
+		moderatorId: staffId(c),
+		playerId,
+		items,
+		skins,
+		customItems,
+	})
+	return c.json({ items, skins, customItems, boxes: gifts.length })
 }
 
 /**

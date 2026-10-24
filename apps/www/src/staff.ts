@@ -4,12 +4,15 @@ import {
 	clearDormSaveBlob,
 	clearPasswordHash,
 	createGift,
+	DEFAULT_USERNAME_CHANGES,
 	getAccount,
+	getAccountByUsername,
 	getImageById,
 	getOnlinePlayerIds,
 	getPlayerIdsInRoom,
 	getPresences,
 	movePlayerToDorm,
+	STAFF_ACCOUNT_IDS,
 	updateAccount,
 	writeAuditLog,
 } from '@repo/domain'
@@ -67,7 +70,7 @@ import { NotificationType } from '../../notify/src/notification-types'
 import { refreshDiscordRoles } from './discord-roles'
 
 import type { Context, MiddlewareHandler } from 'hono'
-import type { GiftContent } from '@repo/domain'
+import type { Account, GiftContent } from '@repo/domain'
 import type { CustomAvatarItem } from '../../api/src/custom-avatar-items-db'
 import type { ReportRow, ReportSearch } from '../../api/src/reports-db'
 import type { CatalogRow } from '../../econ/src/catalog-db'
@@ -1650,4 +1653,158 @@ export async function setSandboxHandler(c: Context<App>) {
 		changed,
 	})
 	return c.json({ sandbox: body.sandbox, changed })
+}
+
+/**
+ * The account fields the "Edit users" tab shows and edits. Deliberately a projection, not the
+ * stored row: the password hash, contact details and login IPs never ride along.
+ */
+function editableAccount(account: Account) {
+	return {
+		accountId: account.accountId,
+		username: account.username,
+		displayName: account.displayName,
+		createdAt: account.createdAt,
+		lastLoginTime: account.lastLoginTime ?? null,
+		availableUsernameChanges: account.availableUsernameChanges ?? DEFAULT_USERNAME_CHANGES,
+		// The roles, as the flags that confer them. `betastudio` is `hasStudio` in the token.
+		isDeveloper: account.isDeveloper === true,
+		isModerator: account.isModerator === true,
+		isInfluencer: account.isInfluencer === true,
+		hasStudio: account.hasStudio === true,
+		hasPlus: account.hasPlus === true,
+		isSandbox: account.isSandbox === true,
+		// The permanent staff accounts (see STAFF_ACCOUNT_IDS) have their staff flags forced on
+		// whatever is stored, so the tab greys those switches out rather than pretend.
+		permanentStaff: STAFF_ACCOUNT_IDS.includes(account.accountId),
+	}
+}
+
+/**
+ * Developer-only: find one player for the "Edit users" tab, by `?name=` — their `@username`
+ * (the `@` is optional), or failing that a numeric account id. Answers the account's editable
+ * fields, or a 404 when nothing matches. An exact match only: acting on a prefix match would
+ * mean editing whoever sorted first.
+ */
+export async function lookupUserHandler(c: Context<App>) {
+	const name = (c.req.query('name') ?? '').trim().replace(/^@/, '')
+	if (name === '') return c.json({ error: 'Enter a username' }, 400)
+
+	let account = await getAccountByUsername(c.env.DB, name)
+	if (account === null && /^\d{1,15}$/.test(name)) {
+		account = await getAccount(c.env.DB, Number(name))
+	}
+	if (account === null) return c.json({ error: `There's no player called @${name}` }, 404)
+
+	return c.json(editableAccount(account))
+}
+
+/** Anything past this is a mistake (or a way to bloat the account row), not a name. */
+const MAX_EDITED_NAME_LENGTH = 1000
+
+/** The boolean flags the edit route sets, by the field the body names them with. */
+const EDITABLE_FLAGS = [
+	'isDeveloper',
+	'isModerator',
+	'isInfluencer',
+	'hasStudio',
+	'hasPlus',
+	'isSandbox',
+] as const
+
+/**
+ * Developer-only: edit any player's account — their `username` (the @), their `displayName`,
+ * and the role flags — in one call. Send only the fields to change.
+ *
+ * The names are exempt from everything a player is held to: no length or character rules, no
+ * profanity filter, and the player's remaining username changes are neither checked nor spent.
+ * The two things that still refuse are an empty name, and a username another account already
+ * holds (compared case-insensitively, because that is how every login and lookup finds one —
+ * two accounts answering to the same name would make one of them unreachable).
+ *
+ * The staff accounts in STAFF_ACCOUNT_IDS keep their developer/moderator/studio flags whatever
+ * is sent: they are forced on every read, so a revoke would only look like it worked.
+ *
+ * Roles ride in the player's token, so they take effect on their NEXT sign-in; a changed name
+ * shows the next time the game reads the account.
+ */
+export async function editUserHandler(c: Context<App>) {
+	const playerId = playerIdParam(c)
+	if (playerId === null) return c.json({ error: 'A numeric player id is required' }, 400)
+
+	const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
+	if (body === null || typeof body !== 'object') {
+		return c.json({ error: 'Expected a JSON body' }, 400)
+	}
+
+	// Read first: `updateAccount` creates the row when there is none.
+	const account = await getAccount(c.env.DB, playerId)
+	if (account === null) return c.json({ error: 'No such player' }, 404)
+
+	const changes: Partial<Account> = {}
+
+	if (body.username !== undefined) {
+		if (typeof body.username !== 'string') return c.json({ error: 'username must be text' }, 400)
+		const username = body.username.trim().replace(/^@/, '')
+		if (username === '') return c.json({ error: 'A username can’t be empty' }, 400)
+		if (username.length > MAX_EDITED_NAME_LENGTH) {
+			return c.json({ error: `A username can’t be over ${MAX_EDITED_NAME_LENGTH} characters` }, 400)
+		}
+		const holder = await getAccountByUsername(c.env.DB, username)
+		if (holder !== null && holder.accountId !== playerId) {
+			return c.json({ error: `@${holder.username} already belongs to another player` }, 409)
+		}
+		if (username !== account.username) changes.username = username
+	}
+
+	if (body.displayName !== undefined) {
+		if (typeof body.displayName !== 'string') {
+			return c.json({ error: 'displayName must be text' }, 400)
+		}
+		if (body.displayName.trim() === '') {
+			return c.json({ error: 'A display name can’t be empty' }, 400)
+		}
+		if (body.displayName.length > MAX_EDITED_NAME_LENGTH) {
+			return c.json(
+				{ error: `A display name can’t be over ${MAX_EDITED_NAME_LENGTH} characters` },
+				400
+			)
+		}
+		if (body.displayName !== account.displayName) changes.displayName = body.displayName
+	}
+
+	const permanent = STAFF_ACCOUNT_IDS.includes(playerId)
+	const refused: string[] = []
+	for (const flag of EDITABLE_FLAGS) {
+		const wanted = body[flag]
+		if (wanted === undefined) continue
+		if (typeof wanted !== 'boolean') return c.json({ error: `${flag} must be true or false` }, 400)
+		if ((account[flag] === true) === wanted) continue
+		// Forced on at every read for these accounts, so a revoke would only look like it worked.
+		const forced = flag === 'isDeveloper' || flag === 'isModerator' || flag === 'hasStudio'
+		if (permanent && forced && !wanted) {
+			refused.push(flag)
+			continue
+		}
+		changes[flag] = wanted
+	}
+
+	const changed = Object.keys(changes)
+	const updated = changed.length > 0 ? await updateAccount(c.env.DB, playerId, changes) : account
+
+	if (changed.length > 0) {
+		await recordPlayerAudit(c, 'edit_user', {
+			playerId,
+			// What it was and is now, for each field that moved — a rename is the one thing here
+			// that can't be reconstructed from the account afterwards.
+			changes: Object.fromEntries(
+				changed.map((key) => [
+					key,
+					{ from: account[key as keyof Account] ?? null, to: changes[key as keyof Account] },
+				])
+			),
+		})
+		logger.info('staff edited an account', { moderatorId: staffId(c), playerId, changed })
+	}
+	return c.json({ ...editableAccount(updated), changed, refused })
 }

@@ -31,6 +31,7 @@ import { DeviceLinkPage } from './DeviceLink'
 import { customAvatarItemIdFromPath, inventionIdFromPath, InventionPage, ItemPage } from './Item'
 import { ModerationPage, PlayerBanStatus } from './Moderation'
 import { StatsPage } from './Stats'
+import { EditUsersForm } from './EditUsers'
 import { StudioAccessPage } from './StudioAccess'
 
 import type { ReactNode } from 'react'
@@ -4003,6 +4004,8 @@ function Dashboard({
 		// Narrower than the two above: the drop mints tokens, and www's route is developer-only.
 		...(isDeveloper()
 			? [
+					// Developer-only like the gifts: it rewrites names, grants roles and gives items.
+					{ id: 'edit-users', label: 'Edit users', render: () => <EditUsersForm /> },
 					{
 						id: 'tokens',
 						label: 'Token drop',

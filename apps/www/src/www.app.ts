@@ -46,6 +46,7 @@ import {
 	clearDormHandler,
 	clearPasswordHandler,
 	createReportHandler,
+	editUserHandler,
 	getReportHandler,
 	giftItemHandler,
 	giftOnlineTokensHandler,
@@ -55,6 +56,7 @@ import {
 	giftXpHandler,
 	grantPlusHandler,
 	linkedAccountsHandler,
+	lookupUserHandler,
 	playerHistoryHandler,
 	requireDeveloper,
 	requireStaff,
@@ -610,6 +612,10 @@ const app = new Hono<App>()
 	// Rec Room Plus is worth tokens and a discount, so granting it is developer-only too.
 	.post('/api/staff/players/:id/grant-plus', requireDeveloper, grantPlusHandler)
 	.post('/api/staff/players/:id/username-changes', addUsernameChangeHandler)
+	// The "Edit users" tab: find a player by name, then change their names and roles. Developer-
+	// only — it rewrites identity and hands out roles. Items go through gift-item above.
+	.get('/api/staff/users/lookup', requireDeveloper, lookupUserHandler)
+	.put('/api/staff/users/:id', requireDeveloper, editUserHandler)
 	.post('/api/staff/players/:id/clear-password', clearPasswordHandler)
 	// Blanks the dorm's newest save so a player can go back to the 2023 client.
 	.post('/api/staff/players/:id/clear-dorm', clearDormHandler)

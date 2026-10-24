@@ -1348,6 +1348,10 @@ export async function giveAllItemsHandler(c: Context<App>) {
 		return c.json({ error: 'No such player' }, 404)
 	}
 
+	// `{ boxes: false }` unlocks everything without minting or announcing any gift boxes.
+	const reqBody = (await c.req.json().catch(() => ({}))) as { boxes?: unknown }
+	const withBoxes = reqBody.boxes !== false
+
 	const { results } = await c.env.DB.prepare(
 		'SELECT * FROM catalog WHERE kind IN (?1, ?2)'
 	)
@@ -1460,7 +1464,7 @@ export async function giveAllItemsHandler(c: Context<App>) {
 	// One gift box per item, skin and custom item, in the same batches, so the player gets the
 	// usual box for each. (Pressing this again adds another box per item.)
 	const createdAt = new Date().toISOString()
-	for (const content of gifts) {
+	for (const content of withBoxes ? gifts : []) {
 		statements.push(
 			c.env.DB.prepare(
 				'INSERT INTO received_gift (account_id, data, created_at) VALUES (?1, ?2, ?3)'
@@ -1475,11 +1479,13 @@ export async function giveAllItemsHandler(c: Context<App>) {
 	// frame carrying its own id. They go through the hub's bulk send, a chunk per RPC, so the
 	// request stays inside its subrequest budget. A player who is offline has them queued (the
 	// hub keeps the newest few hundred) and still finds every box in `GET /api/avatar/v2/gifts`.
-	const { results: made } = await c.env.DB.prepare(
-		'SELECT id, data FROM received_gift WHERE account_id = ?1 AND created_at = ?2 ORDER BY id'
-	)
-		.bind(playerId, createdAt)
-		.all<{ id: number; data: string }>()
+	const { results: made } = withBoxes
+		? await c.env.DB.prepare(
+			'SELECT id, data FROM received_gift WHERE account_id = ?1 AND created_at = ?2 ORDER BY id'
+		)
+			.bind(playerId, createdAt)
+			.all<{ id: number; data: string }>()
+		: { results: [] as { id: number; data: string }[] }
 	const frames: PlayerNotification[] = made.map((g) => ({
 		playerId,
 		notificationType: NotificationType.GiftPackageReceivedImmediate,
@@ -1505,7 +1511,7 @@ export async function giveAllItemsHandler(c: Context<App>) {
 		items,
 		skins,
 		customItems,
-		boxes: gifts.length,
+		boxes: withBoxes ? gifts.length : 0,
 	})
 	logger.info('staff gave every item and skin', {
 		moderatorId: staffId(c),
@@ -1514,7 +1520,34 @@ export async function giveAllItemsHandler(c: Context<App>) {
 		skins,
 		customItems,
 	})
-	return c.json({ items, skins, customItems, boxes: gifts.length })
+	return c.json({ items, skins, customItems, boxes: withBoxes ? gifts.length : 0 })
+}
+
+/**
+ * Open ALL of a player's pending gift boxes at once. Opening a box only dismisses it (every
+ * item was granted when the box was made), so this deletes the player's `received_gift` rows
+ * and nothing else. Reports how many there were.
+ */
+export async function openAllBoxesHandler(c: Context<App>) {
+	const playerId = playerIdParam(c)
+	if (playerId === null) return c.json({ error: 'A numeric player id is required' }, 400)
+	if ((await getAccount(c.env.DB, playerId)) === null) {
+		return c.json({ error: 'No such player' }, 404)
+	}
+	const row = await c.env.DB.prepare(
+		'SELECT count(*) AS n FROM received_gift WHERE account_id = ?1'
+	)
+		.bind(playerId)
+		.first<{ n: number }>()
+	const opened = row?.n ?? 0
+	await c.env.DB.prepare('DELETE FROM received_gift WHERE account_id = ?1').bind(playerId).run()
+	await recordPlayerAudit(c, 'open_all_boxes', { playerId, opened })
+	logger.info('staff opened all of a player\'s gift boxes', {
+		moderatorId: staffId(c),
+		playerId,
+		opened,
+	})
+	return c.json({ opened })
 }
 
 /**

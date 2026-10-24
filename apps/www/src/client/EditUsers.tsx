@@ -110,6 +110,8 @@ function UserEditor({
 	const [level, setLevel] = useState(String(user.level))
 	const levelSave = useAction()
 	const allItems = useAction()
+	const allItemsNoBoxes = useAction()
+	const openBoxes = useAction()
 	const [support, setSupport] = useState(user.isInfluencer)
 	const supportSave = useAction()
 	const [itemId, setItemId] = useState('')
@@ -404,6 +406,47 @@ function UserEditor({
 						{allItems.pending ? 'Giving…' : 'Give all items and skins'}
 					</button>
 				</form>
+				<p className="hint">
+					Or unlock everything without any gift boxes, and clear the boxes they already have.
+				</p>
+				{allItemsNoBoxes.error && <p className="error">{allItemsNoBoxes.error}</p>}
+				{allItemsNoBoxes.done && <p className="ok">{allItemsNoBoxes.done}</p>}
+				<button
+					type="button"
+					disabled={allItemsNoBoxes.pending}
+					onClick={() => {
+						void allItemsNoBoxes.run(async () => {
+							const res = await call<{
+								items: number
+								skins: number
+								customItems: number
+							}>(`/api/staff/players/${user.accountId}/give-all-items`, {
+								authed: true,
+								json: { boxes: false },
+							})
+							return `Gave @${user.username} ${res.items.toLocaleString()} items, ${res.skins.toLocaleString()} skins and ${res.customItems.toLocaleString()} custom items, no boxes.`
+						})
+					}}
+				>
+					{allItemsNoBoxes.pending ? 'Giving…' : 'Give all items (no boxes)'}
+				</button>
+				{openBoxes.error && <p className="error">{openBoxes.error}</p>}
+				{openBoxes.done && <p className="ok">{openBoxes.done}</p>}
+				<button
+					type="button"
+					disabled={openBoxes.pending}
+					onClick={() => {
+						void openBoxes.run(async () => {
+							const res = await call<{ opened: number }>(
+								`/api/staff/players/${user.accountId}/open-all-boxes`,
+								{ authed: true, json: {} }
+							)
+							return `Opened ${res.opened.toLocaleString()} of @${user.username}'s gift boxes.`
+						})
+					}}
+				>
+					{openBoxes.pending ? 'Opening…' : 'Open all gift boxes'}
+				</button>
 			</section>
 		</>
 	)

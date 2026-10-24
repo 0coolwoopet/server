@@ -138,7 +138,9 @@ class GithubBucket {
 
 	private async token(): Promise<string> {
 		const source = this.tokenSource
-		const token = typeof source === 'string' ? source : await source?.get()
+		// Trimmed: a token pasted into the Secrets Store with a trailing newline or space is
+		// rejected by GitHub as bad credentials (401), which looks like a dead token.
+		const token = (typeof source === 'string' ? source : await source?.get())?.trim()
 		if (!token) throw new Error('GITHUB_STORAGE_TOKEN is not configured')
 		return token
 	}
@@ -173,7 +175,10 @@ class GithubBucket {
 	private async stat(path: string): Promise<{ sha: string; size: number; content?: Uint8Array } | null> {
 		const res = await this.api('GET', path)
 		if (res.status === 404) return null
-		if (!res.ok) throw new Error(`GitHub storage stat ${path} failed: ${res.status}`)
+		if (!res.ok) {
+			const detail = await res.text().catch(() => '')
+			throw new Error(`GitHub storage stat ${path} failed: ${res.status} ${detail.slice(0, 200)}`)
+		}
 		const json = (await res.json()) as {
 			type?: string
 			sha?: string

@@ -193,6 +193,27 @@ export async function addXp(db: D1Database, accountId: number, xp: number): Prom
 	}
 }
 
+/**
+ * Set a player's level outright (staff correction), clearing the progress into the next
+ * level. No upper cap (the ladder's {@link MAX_LEVEL} only limits earned levels); floored
+ * at 1. Pays out no level-up rewards.
+ */
+export async function setLevel(
+	db: D1Database,
+	accountId: number,
+	level: number
+): Promise<Progression> {
+	const clamped = Math.max(Math.trunc(level), 1)
+	await db
+		.prepare(
+			`INSERT INTO progression (account_id, level, xp) VALUES (?1, ?2, 0)
+			 ON CONFLICT (account_id) DO UPDATE SET level = excluded.level, xp = 0`
+		)
+		.bind(accountId, clamped)
+		.run()
+	return { PlayerId: accountId, Level: clamped, XP: 0 }
+}
+
 /** One player's progression, defaulted when they've earned nothing yet. */
 export async function getProgression(db: D1Database, accountId: number): Promise<Progression> {
 	const row = await db

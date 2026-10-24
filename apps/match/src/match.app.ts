@@ -3741,9 +3741,7 @@ async function sweepExpiredPresence(env: Env): Promise<void> {
 	const lapsedPlayerIds = await getExpiredPresenceAccountIds(env.DB)
 	const removed = await deleteExpiredPresence(env.DB)
 	const emptyInstanceIds = await deleteEmptyRoomInstances(env.DB)
-	for (const instanceId of staleInstanceIds) {
-		await refreshInstanceFullness(env.DB, instanceId)
-	}
+	await Promise.all(staleInstanceIds.map((instanceId) => refreshInstanceFullness(env.DB, instanceId)))
 	for (const playerId of lapsedPlayerIds) {
 		await notifyFriendsPresence(env, playerId)
 	}

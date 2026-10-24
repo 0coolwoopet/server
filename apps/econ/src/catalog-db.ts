@@ -278,16 +278,6 @@ export async function getCatalogItemById(
 		.first<CatalogRow>()
 }
 
-/**
- * Store listings by `PurchasableItemId` (the `catalog_id`), as the served store lists them —
- * what `POST /api/storefronts/v1/purchasableitems` answers. In the order asked; an unknown id,
- * a repeat, or a row without a listing is skipped rather than left as a hole, so the result may
- * be SHORTER than the input and must not be read positionally.
- *
- * Every kind resolves — avatar items, consumables, skins and custom avatar items alike — and the
- * listing is served exactly as the store lists it. Only listings that load as no row at all
- * (loot boxes, token bundles, consumable packs; see `ListingKind`) are unknown here.
- */
 export async function getStoreListings(db: D1Database, ids: number[]): Promise<StoreListing[]> {
 	const unique = [...new Set(ids)]
 	if (unique.length === 0) return []

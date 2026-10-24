@@ -4715,8 +4715,8 @@ describe('rooms endpoints', () => {
 		await env.DB.prepare('DELETE FROM presence WHERE account_id IN (1, 2)').run()
 	})
 
-	it('GET /photon_access_token grants the global maker pen to dev accounts (1/2/3), nothing else', async () => {
-		for (const sub of ['1', '2', '3']) {
+	it('GET /photon_access_token grants the global maker pen to dev accounts (1/2), nothing else', async () => {
+		for (const sub of ['1', '2']) {
 			// Out of any room: a visitor with the dev maker pen.
 			const res = await SELF.fetch(`${ORIGIN}/photon_access_token`, { headers: await bearer(sub) })
 			expect(res.status).toBe(200)
@@ -5364,17 +5364,19 @@ describe('rooms endpoints', () => {
 		})
 
 		it('applies over the dev accounts’ global maker pen', async () => {
-			// Account 3 is one of the hardcoded dev accounts, so it holds the global maker pen
+			// Account 2 is one of the hardcoded dev accounts, so it holds the global maker pen
 			// in every room — the one grant a subroom's table doesn't take away.
 			await putPermissions(
 				'/rooms/2/subrooms/2/permissions',
 				[{ Permission: 'CAN_USE_MAKER_PEN', Role: 0, Override: true, Type: 0, Value: 'False' }],
 				'1'
 			)
-			const devTable = await permissionsIn(3, 2)
-			expect(devTable.filter((p) => p.Permission === 'CAN_USE_MAKER_PEN')).toEqual([
-				{ Override: true, Permission: 'CAN_USE_MAKER_PEN', Role: 0, Type: 0, Value: 'True' },
-			])
+			const devTable = await permissionsIn(2, 2)
+			expect(
+				devTable.filter((p) => p.Permission === 'CAN_USE_MAKER_PEN' && p.Role === 0)
+			).toEqual([{ Override: true, Permission: 'CAN_USE_MAKER_PEN', Role: 0, Type: 0, Value: 'True' }])
+			// Account 3 is not a dev account.
+			expect(valueOf(await permissionsIn(3, 2), 'CAN_USE_MAKER_PEN')).toBe('False')
 			// A normal player in the same subroom has none, as before.
 			expect(valueOf(await permissionsIn(745, 2), 'CAN_USE_MAKER_PEN')).toBe('False')
 		})

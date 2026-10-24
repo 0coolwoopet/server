@@ -1139,11 +1139,28 @@ function storefrontAssetPath(id: string, build: number | null): string {
  */
 async function loadStorefront(c: Context<App>, storefrontType: number): Promise<Storefront | null> {
 	const build = await authedBuild(c)
-	const res = await c.env.ASSETS.fetch(
-		new URL(storefrontAssetPath(String(storefrontType), build), c.req.url)
-	)
+	return readStorefrontAsset(c, storefrontAssetPath(String(storefrontType), build))
+}
+
+/**
+ * Parsed storefront files, kept per isolate. The files are static assets that only change with
+ * a deploy (which replaces the isolate), and sf3-2025 alone is several thousand items, so
+ * fetching and parsing it on every browse or purchase was most of the request's CPU. Only the
+ * resolved value is kept (never a promise, which can't be awaited across requests), and callers
+ * treat it as read-only.
+ */
+const storefrontCache = new Map<string, Storefront>()
+const STOREFRONT_CACHE_MAX = 16
+
+async function readStorefrontAsset(c: Context<App>, path: string): Promise<Storefront | null> {
+	const hit = storefrontCache.get(path)
+	if (hit !== undefined) return hit
+	const res = await c.env.ASSETS.fetch(new URL(path, c.req.url))
 	if (!res.ok) return null
-	return (await res.json()) as Storefront
+	const parsed = (await res.json()) as Storefront
+	if (storefrontCache.size >= STOREFRONT_CACHE_MAX) storefrontCache.clear()
+	storefrontCache.set(path, parsed)
+	return parsed
 }
 
 /**
@@ -5166,13 +5183,13 @@ const app = new Hono<App>({ strict: false })
 			const have = new Set(found.map((l) => (l as { PurchasableItemId?: number }).PurchasableItemId))
 			const missing = [...new Set(ids)].filter((id) => !have.has(id))
 			if (missing.length === 0) return c.json(found)
-			const res = await c.env.ASSETS.fetch(new URL('/sf3-2025.json', c.req.url))
-			if (!res.ok) return c.json(found)
-			const store = (await res.json()) as Storefront
+			const store = await readStorefrontAsset(c, '/sf3-2025.json')
+			if (store === null) return c.json(found)
+			const missingSet = new Set(missing)
 			const byId = new Map<number, unknown>()
 			for (const l of found) byId.set((l as { PurchasableItemId: number }).PurchasableItemId, l)
 			for (const it of store.StoreItems) {
-				if (missing.includes(it.PurchasableItemId)) byId.set(it.PurchasableItemId, it)
+				if (missingSet.has(it.PurchasableItemId)) byId.set(it.PurchasableItemId, it)
 			}
 			return c.json([...new Set(ids)].flatMap((id) => (byId.has(id) ? [byId.get(id)] : [])))
 		}
@@ -5435,7 +5452,11 @@ const app = new Hono<App>({ strict: false })
 			const path = storefrontAssetPath(id, await authedBuild(c))
 			const res = await c.env.ASSETS.fetch(new URL(path, c.req.url))
 			if (!res.ok) return c.notFound()
-			return c.json(await res.json())
+			// The file already is the JSON body: pass it through instead of parsing a
+			// multi-thousand-item catalog only to serialize it again.
+			return new Response(res.body, {
+				headers: { 'content-type': 'application/json; charset=UTF-8' },
+			})
 		}
 	)
 
@@ -5702,9 +5723,11 @@ const app = new Hono<App>({ strict: false })
 			})
 			const guids = guidLines.map((line) => line.guid)
 			const owned = new Map<number, Set<string>>()
-			for (const receiverId of new Set(guidLines.map((line) => line.receiverId))) {
-				owned.set(receiverId, await ownedCustomAvatarItemIds(c.env.DB, receiverId, guids))
-			}
+			await Promise.all(
+				[...new Set(guidLines.map((line) => line.receiverId))].map(async (receiverId) => {
+					owned.set(receiverId, await ownedCustomAvatarItemIds(c.env.DB, receiverId, guids))
+				})
+			)
 			const custom: CustomBagContext = {
 				buyerId: id,
 				items: new Map(

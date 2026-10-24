@@ -17,6 +17,7 @@ interface EditableUser {
 	createdAt: string
 	lastLoginTime: string | null
 	availableUsernameChanges: number
+	level: number
 	isDeveloper: boolean
 	isModerator: boolean
 	isInfluencer: boolean
@@ -26,12 +27,11 @@ interface EditableUser {
 	permanentStaff: boolean
 }
 
-type RoleFlag = 'isDeveloper' | 'isModerator' | 'isInfluencer' | 'hasStudio' | 'hasPlus' | 'isSandbox'
+type RoleFlag = 'isDeveloper' | 'isModerator' | 'hasStudio' | 'hasPlus' | 'isSandbox'
 
 const ROLES: Array<{ flag: RoleFlag; label: string; hint: string; lockedForStaff?: boolean }> = [
 	{ flag: 'isDeveloper', label: 'Developer', hint: 'Full staff: gifts, drops, this tab.', lockedForStaff: true },
 	{ flag: 'isModerator', label: 'Moderator', hint: 'Reports, bans and warnings.', lockedForStaff: true },
-	{ flag: 'isInfluencer', label: 'Influencer', hint: 'Influencer partner program.' },
 	{ flag: 'hasStudio', label: 'Studio access', hint: 'May upload from Rec Room Studio.', lockedForStaff: true },
 	{ flag: 'hasPlus', label: 'Rec Room Plus', hint: 'The paid tier.' },
 	{ flag: 'isSandbox', label: 'Sandbox', hint: 'Served from the sandbox voice servers.' },
@@ -103,11 +103,14 @@ function UserEditor({
 	const [roles, setRoles] = useState<Record<RoleFlag, boolean>>({
 		isDeveloper: user.isDeveloper,
 		isModerator: user.isModerator,
-		isInfluencer: user.isInfluencer,
 		hasStudio: user.hasStudio,
 		hasPlus: user.hasPlus,
 		isSandbox: user.isSandbox,
 	})
+	const [level, setLevel] = useState(String(user.level))
+	const levelSave = useAction()
+	const [support, setSupport] = useState(user.isInfluencer)
+	const supportSave = useAction()
 	const [itemId, setItemId] = useState('')
 	const [giftMessage, setGiftMessage] = useState('')
 	const names = useAction()
@@ -188,6 +191,78 @@ function UserEditor({
 			</section>
 
 			<section className="card">
+				<h2>Level</h2>
+				<form
+					onSubmit={(e) => {
+						e.preventDefault()
+						void levelSave.run(async () => {
+							const res = await save({ level: Number(level) })
+							setLevel(String(res.level))
+							return res.changed.includes('level')
+								? `Set to level ${res.level}.`
+								: 'Nothing to change.'
+						})
+					}}
+				>
+					<label>
+						Level
+						<input
+							type="number"
+							min={1}
+							step={1}
+							value={level}
+							required
+							onChange={(e) => setLevel(e.target.value)}
+						/>
+						<span className="hint">
+							Sets the level directly and resets their progress into the next one. No level-up
+							rewards are paid.
+						</span>
+					</label>
+					{levelSave.error && <p className="error">{levelSave.error}</p>}
+					{levelSave.done && <p className="ok">{levelSave.done}</p>}
+					<button type="submit" disabled={levelSave.pending}>
+						{levelSave.pending ? 'Saving…' : 'Save level'}
+					</button>
+				</form>
+			</section>
+
+			<section className="card">
+				<h2>Support button</h2>
+				<form
+					onSubmit={(e) => {
+						e.preventDefault()
+						void supportSave.run(async () => {
+							const res = await save({ isInfluencer: support })
+							setSupport(res.isInfluencer)
+							return res.changed.includes('isInfluencer')
+								? res.isInfluencer
+									? 'They are now a verified creator — players can support them.'
+									: 'Support button removed.'
+								: 'Nothing to change.'
+						})
+					}}
+				>
+					<label>
+						User has support button
+						<select value={support ? 'yes' : 'no'} onChange={(e) => setSupport(e.target.value === 'yes')}>
+							<option value="no">No</option>
+							<option value="yes">Yes</option>
+						</select>
+						<span className="hint">
+							Yes makes them a verified creator (the influencer partner program), so other players
+							get the Support button on their profile. Takes effect on their next sign-in.
+						</span>
+					</label>
+					{supportSave.error && <p className="error">{supportSave.error}</p>}
+					{supportSave.done && <p className="ok">{supportSave.done}</p>}
+					<button type="submit" disabled={supportSave.pending}>
+						{supportSave.pending ? 'Saving…' : 'Save'}
+					</button>
+				</form>
+			</section>
+
+			<section className="card">
 				<h2>Roles</h2>
 				<p className="muted">
 					Roles ride in the player&apos;s sign-in token, so a change reaches them the next time they
@@ -202,7 +277,6 @@ function UserEditor({
 							setRoles({
 								isDeveloper: res.isDeveloper,
 								isModerator: res.isModerator,
-								isInfluencer: res.isInfluencer,
 								hasStudio: res.hasStudio,
 								hasPlus: res.hasPlus,
 								isSandbox: res.isSandbox,

@@ -11,8 +11,10 @@ import {
 	getOnlinePlayerIds,
 	getPlayerIdsInRoom,
 	getPresences,
+	getProgression,
 	movePlayerToDorm,
 	STAFF_ACCOUNT_IDS,
+	setLevel,
 	updateAccount,
 	writeAuditLog,
 } from '@repo/domain'
@@ -1659,8 +1661,9 @@ export async function setSandboxHandler(c: Context<App>) {
  * The account fields the "Edit users" tab shows and edits. Deliberately a projection, not the
  * stored row: the password hash, contact details and login IPs never ride along.
  */
-function editableAccount(account: Account) {
+function editableAccount(account: Account, level: number) {
 	return {
+		level,
 		accountId: account.accountId,
 		username: account.username,
 		displayName: account.displayName,
@@ -1696,7 +1699,7 @@ export async function lookupUserHandler(c: Context<App>) {
 	}
 	if (account === null) return c.json({ error: `There's no player called @${name}` }, 404)
 
-	return c.json(editableAccount(account))
+	return c.json(editableAccount(account, (await getProgression(c.env.DB, account.accountId)).Level))
 }
 
 /** Anything past this is a mistake (or a way to bloat the account row), not a name. */
@@ -1773,6 +1776,15 @@ export async function editUserHandler(c: Context<App>) {
 		if (body.displayName !== account.displayName) changes.displayName = body.displayName
 	}
 
+	let newLevel: number | null = null
+	if (body.level !== undefined) {
+		const wanted = Number(body.level)
+		if (!Number.isInteger(wanted) || wanted < 1 || !Number.isSafeInteger(wanted)) {
+			return c.json({ error: 'level must be a whole number, 1 or higher' }, 400)
+		}
+		newLevel = wanted
+	}
+
 	const permanent = STAFF_ACCOUNT_IDS.includes(playerId)
 	const refused: string[] = []
 	for (const flag of EDITABLE_FLAGS) {
@@ -1792,19 +1804,48 @@ export async function editUserHandler(c: Context<App>) {
 	const changed = Object.keys(changes)
 	const updated = changed.length > 0 ? await updateAccount(c.env.DB, playerId, changes) : account
 
-	if (changed.length > 0) {
+	let progression = await getProgression(c.env.DB, playerId)
+	if (newLevel !== null && newLevel !== progression.Level) {
+		const from = progression.Level
+		progression = await setLevel(c.env.DB, playerId, newLevel)
+		changed.push('level')
+		await recordPlayerAudit(c, 'edit_user_level', { playerId, from, to: progression.Level })
+		logger.info('staff set a level', { moderatorId: staffId(c), playerId, from, to: progression.Level })
+		try {
+			await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
+				playerId,
+				NotificationType.PlayerProgressionLevelUpdate,
+				{
+					PlayerId: progression.PlayerId,
+					Level: progression.Level,
+					XP: progression.XP,
+				} satisfies PlayerProgressionLevelPayload
+			)
+		} catch (err) {
+			logger.error('failed to push a staff level change', {
+				playerId,
+				error: err instanceof Error ? err.message : String(err),
+			})
+		}
+	}
+
+	if (Object.keys(changes).length > 0) {
 		await recordPlayerAudit(c, 'edit_user', {
 			playerId,
 			// What it was and is now, for each field that moved — a rename is the one thing here
 			// that can't be reconstructed from the account afterwards.
 			changes: Object.fromEntries(
-				changed.map((key) => [
+				Object.keys(changes).map((key) => [
 					key,
 					{ from: account[key as keyof Account] ?? null, to: changes[key as keyof Account] },
 				])
 			),
 		})
-		logger.info('staff edited an account', { moderatorId: staffId(c), playerId, changed })
+		logger.info('staff edited an account', {
+			moderatorId: staffId(c),
+			playerId,
+			changed: Object.keys(changes),
+		})
 	}
-	return c.json({ ...editableAccount(updated), changed, refused })
+	return c.json({ ...editableAccount(updated, progression.Level), changed, refused })
 }

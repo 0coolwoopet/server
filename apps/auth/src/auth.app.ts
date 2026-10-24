@@ -445,10 +445,15 @@ function oauthError(
  */
 async function issueSession(c: Context<App>, accountId: number, grantType: string) {
 	const clientIp = c.req.header('cf-connecting-ip') ?? ''
-	const ban = await resolveBan(c.env.DB, accountId, {
-		identity: { ip: clientIp },
-		arms: banEvasionMatch(c.env.BAN_EVASION_MATCH),
-	})
+	// Three independent reads, issued together rather than one after another.
+	const [ban, jwtSecret, roleAccount] = await Promise.all([
+		resolveBan(c.env.DB, accountId, {
+			identity: { ip: clientIp },
+			arms: banEvasionMatch(c.env.BAN_EVASION_MATCH),
+		}),
+		c.env.JWT_SECRET.get(),
+		getAccount(c.env.DB, accountId),
+	])
 	if (ban) {
 		logger.info('token issued to a blocked account', {
 			accountId,
@@ -459,29 +464,30 @@ async function issueSession(c: Context<App>, accountId: number, grantType: strin
 		})
 	}
 
-	const jwtSecret = await c.env.JWT_SECRET.get()
 	if (jwtSecret === '') {
 		logger.error('refusing to issue token: JWT_SECRET is empty')
 		return oauthError(c, 'server_error', 'token signing is not configured', 500)
 	}
 
-	const roleAccount = await getAccount(c.env.DB, accountId)
 	if (!roleAccount) return oauthError(c, 'invalid_grant', 'account no longer exists')
 
-	const accessToken = await generateToken(
-		String(accountId),
-		roleAccount.platformId ?? '',
-		accountPlatform(roleAccount),
-		jwtSecret,
-		accountRoles(roleAccount),
-		accountPrivileges(roleAccount),
-		GAME_VERSION,
-		// Rec Room Plus is always on for every account on this server.
-		true
-	)
-	const refreshToken = await issueRefreshToken(c.env.DB, accountId)
-	await setLastLoginTime(c.env.DB, accountId, new Date().toISOString())
-	await setLoginContext(c.env.DB, accountId, { ip: clientIp })
+	// Signing the token and the three writes don't depend on each other.
+	const [accessToken, refreshToken] = await Promise.all([
+		generateToken(
+			String(accountId),
+			roleAccount.platformId ?? '',
+			accountPlatform(roleAccount),
+			jwtSecret,
+			accountRoles(roleAccount),
+			accountPrivileges(roleAccount),
+			GAME_VERSION,
+			// Rec Room Plus is always on for every account on this server.
+			true
+		),
+		issueRefreshToken(c.env.DB, accountId),
+		setLastLoginTime(c.env.DB, accountId, new Date().toISOString()),
+		setLoginContext(c.env.DB, accountId, { ip: clientIp }),
+	])
 
 	const staffRoles = (['developer', 'moderator'] as const).filter((role) =>
 		holdsRole(roleAccount, role)
@@ -830,11 +836,15 @@ const app = new Hono<App>()
 			const body = await c.req.parseBody({ all: true }).catch(() => ({}) as Record<string, unknown>)
 			const raw = body.id
 			const ids = (Array.isArray(raw) ? raw : raw != null ? [raw] : []).map(String)
-			const out: Array<ReturnType<typeof toCachedLogin>> = []
-			for (const pid of ids) {
-				// No platform accompanies these ids, so they match on any platform.
-				out.push(...(await toCachedLogins(c.env.DB, await getLinksForPlatformId(c.env.DB, pid))))
-			}
+			// No platform accompanies these ids, so they match on any platform. Looked up
+			// concurrently; `Promise.all` keeps the results in request order.
+			const out = (
+				await Promise.all(
+					ids.map(async (pid) =>
+						toCachedLogins(c.env.DB, await getLinksForPlatformId(c.env.DB, pid))
+					)
+				)
+			).flat()
 			return c.json(out)
 		}
 	)
@@ -1421,8 +1431,10 @@ const app = new Hono<App>()
 					)
 				}
 				accountId = String(account.accountId)
-				await setLastLoginTime(c.env.DB, account.accountId, new Date().toISOString())
-				await setLoginContext(c.env.DB, account.accountId, { deviceId, deviceClass, ip: clientIp })
+				await Promise.all([
+					setLastLoginTime(c.env.DB, account.accountId, new Date().toISOString()),
+					setLoginContext(c.env.DB, account.accountId, { deviceId, deviceClass, ip: clientIp }),
+				])
 			} else {
 				// Resolve the account from a posted numeric `account_id` or, as RecRoom's
 				// password grant sends, a `username` (case-insensitive; trailing whitespace
@@ -1466,8 +1478,10 @@ const app = new Hono<App>()
 						intVar(c.env.MAX_ACCOUNTS_PER_PLATFORM_ID, DEFAULT_MAX_ACCOUNTS_PER_PLATFORM_ID)
 					)
 				}
-				await setLastLoginTime(c.env.DB, resolvedId, new Date().toISOString())
-				await setLoginContext(c.env.DB, resolvedId, { deviceId, deviceClass, ip: clientIp })
+				await Promise.all([
+					setLastLoginTime(c.env.DB, resolvedId, new Date().toISOString()),
+					setLoginContext(c.env.DB, resolvedId, { deviceId, deviceClass, ip: clientIp }),
+				])
 			}
 
 			// The rollout gate: a build under staged rollout (`rolloutGameBuilds`) is for staff
@@ -1521,10 +1535,16 @@ const app = new Hono<App>()
 			// The request's own IP and proven identity are passed alongside the account, so a
 			// ban also reaches an old, clean account logged into from the banned player's device
 			// or network — the stored ips alone would only catch that on the SECOND login.
-			const ban = await resolveBan(c.env.DB, Number(accountId), {
-				identity: { ip: clientIp, platform: verifiedPlatform, platformId: verifiedPlatformId },
-				arms: banEvasionMatch(c.env.BAN_EVASION_MATCH),
-			})
+			// The ban check, the signing secret and the account row are independent reads, so
+			// they go out together.
+			const [ban, jwtSecret, roleAccount] = await Promise.all([
+				resolveBan(c.env.DB, Number(accountId), {
+					identity: { ip: clientIp, platform: verifiedPlatform, platformId: verifiedPlatformId },
+					arms: banEvasionMatch(c.env.BAN_EVASION_MATCH),
+				}),
+				c.env.JWT_SECRET.get(),
+				getAccount(c.env.DB, Number(accountId)),
+			])
 			if (ban) {
 				logger.info('token issued to a blocked account', {
 					accountId,
@@ -1540,7 +1560,6 @@ const app = new Hono<App>()
 			// binding) would still yield a well-formed token — but one signed with an empty
 			// key, which every worker validates against, so anyone could forge it. Refuse to
 			// issue a token at all rather than complete the login with a forgeable credential.
-			const jwtSecret = await c.env.JWT_SECRET.get()
 			if (jwtSecret === '') {
 				logger.error('refusing to issue token: JWT_SECRET is empty')
 				return c.json(
@@ -1554,32 +1573,33 @@ const app = new Hono<App>()
 			// /role/* lookups), and its Plus flag into `rn.plus`. One read of the just-resolved
 			// account serves both; they thus refresh on every login and every refresh_token
 			// grant.
-			const roleAccount = await getAccount(c.env.DB, Number(accountId))
 			// A refresh grant posts no platform of its own, so the identity comes off the
 			// account — the same read, and the only place the bound identity is authoritative.
 			if (grantType === 'refresh_token' && roleAccount) {
 				platform = accountPlatform(roleAccount)
 				platformId = roleAccount.platformId ?? ''
 			}
-			const accessToken = await generateToken(
-				accountId,
-				platformId,
-				platform,
-				jwtSecret,
-				accountRoles(roleAccount),
-				accountPrivileges(roleAccount),
-				version,
-				// Rec Room Plus, off the same account read as the roles above — `econ` decides the
-				// CampusCard and the subscriber discount from this claim alone, so it never has to
-				// load the account. It therefore refreshes on every login and every refresh_token
-				// grant, and only then: a player who claims Plus on the website keeps a token that
-				// says otherwise until they sign in again.
-				// Rec Room Plus is always on for every account on this server.
-				true
-			)
-			// Issue a fresh, persisted refresh token (single-use; the client redeems it via
-			// grant_type=refresh_token). A refresh grant thus rotates its token.
-			const refreshToken = await issueRefreshToken(c.env.DB, Number(accountId))
+			const [accessToken, refreshToken] = await Promise.all([
+				generateToken(
+					accountId,
+					platformId,
+					platform,
+					jwtSecret,
+					accountRoles(roleAccount),
+					accountPrivileges(roleAccount),
+					version,
+					// Rec Room Plus, off the same account read as the roles above — `econ` decides the
+					// CampusCard and the subscriber discount from this claim alone, so it never has to
+					// load the account. It therefore refreshes on every login and every refresh_token
+					// grant, and only then: a player who claims Plus on the website keeps a token that
+					// says otherwise until they sign in again.
+					// Rec Room Plus is always on for every account on this server.
+					true
+				),
+				// Issue a fresh, persisted refresh token (single-use; the client redeems it via
+				// grant_type=refresh_token). A refresh grant thus rotates its token.
+				issueRefreshToken(c.env.DB, Number(accountId)),
+			])
 
 			// A STAFF sign-in is an audit event in its own right. What these accounts then do is
 			// recorded against them on the `audit_log` table (`notify` files every `/internal/*`

@@ -318,7 +318,12 @@ for first in notify auth; do
 	deploy_one "$first"
 done
 
-others=$(for dir in apps/*/; do n=$(basename "$dir"); case "$n" in notify | auth) ;; *) echo "$n" ;; esac; done)
+# Apps without a `deploy` script (e.g. `mono`, the combined worker) aren't deployed here.
+others=$(for dir in apps/*/; do
+	n=$(basename "$dir")
+	case "$n" in notify | auth) continue ;; esac
+	jq -e '.scripts.deploy' "$dir/package.json" >/dev/null 2>&1 && echo "$n"
+done)
 failed=0
 # A handful at a time: wrangler is memory-hungry and these are 25+ workers.
 printf '%s\n' $others | xargs -P 4 -I{} sh -c 'cd "$1/apps/{}" && pnpm run deploy' _ "$ROOT" || failed=1

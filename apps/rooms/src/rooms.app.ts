@@ -250,8 +250,8 @@ function allIds(idParam: string): number[] {
 const DEFAULT_MAX_ROOMS_PER_ACCOUNT = 10
 
 /** Account ids granted the global (Role 0) maker pen — the reference server's
- * hardcoded moderator/dev accounts. */
-const MAKER_PEN_ACCOUNT_IDS = new Set([1, 2, 3])
+ * hardcoded dev accounts (1 and 2). */
+const MAKER_PEN_ACCOUNT_IDS = new Set([1, 2])
 
 /**
  * The slice of the shared presence row we read — the caller's current room instance.
@@ -388,8 +388,14 @@ function photonAccessToken(
 			}
 		}
 		if (MAKER_PEN_ACCOUNT_IDS.has(accountId)) {
-			const own = permissions.find((p) => p.Permission === 'CAN_USE_MAKER_PEN' && p.Role === role)
-			if (own) own.Value = 'True'
+			// Both the Role 0 row (the "global" cell the client reads when it isn't looking up a
+			// role) and their own role's row, so no stored override in any room (quests,
+			// registration, …) can take the pen from them.
+			for (const p of permissions) {
+				if (p.Permission === 'CAN_USE_MAKER_PEN' && (p.Role === Role.None || p.Role === role)) {
+					p.Value = 'True'
+				}
+			}
 		}
 	} else {
 		// Anyone else: their own values, at Role 0 and at their role.

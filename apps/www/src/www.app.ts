@@ -49,6 +49,7 @@ import {
 	editUserHandler,
 	getReportHandler,
 	giftItemHandler,
+	giveAllItemsHandler,
 	giftOnlineTokensHandler,
 	giftRoleTokensHandler,
 	giftRoomTokensHandler,
@@ -596,6 +597,8 @@ const app = new Hono<App>()
 	.post('/api/staff/players/:id/gift-tokens', requireDeveloper, giftTokensHandler)
 	// One id field for a custom avatar item, a skin or a consumable; the kind is resolved here.
 	.post('/api/staff/players/:id/gift-item', requireDeveloper, giftItemHandler)
+	// Every avatar item and skin in the catalog, straight into the inventory.
+	.post('/api/staff/players/:id/give-all-items', requireDeveloper, giveAllItemsHandler)
 	.post('/api/staff/players/:id/gift-xp', requireDeveloper, giftXpHandler)
 	// Everyone standing in a room, across all of its instances.
 	.post('/api/staff/rooms/:roomId/gift-tokens', requireDeveloper, giftRoomTokensHandler)

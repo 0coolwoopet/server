@@ -109,6 +109,7 @@ function UserEditor({
 	})
 	const [level, setLevel] = useState(String(user.level))
 	const levelSave = useAction()
+	const allItems = useAction()
 	const [support, setSupport] = useState(user.isInfluencer)
 	const supportSave = useAction()
 	const [itemId, setItemId] = useState('')
@@ -371,6 +372,31 @@ function UserEditor({
 						{itemGift.pending ? 'Sending…' : 'Give item'}
 					</button>
 				</form>
+			</section>
+
+			<section className="card">
+				<h2>Give all items and skins</h2>
+				<p className="hint">
+					Unlocks every avatar item and skin in the catalog for @{user.username}. Safe to press
+					again; nothing is doubled.
+				</p>
+				{allItems.error && <p className="error">{allItems.error}</p>}
+				{allItems.done && <p className="ok">{allItems.done}</p>}
+				<button
+					type="button"
+					disabled={allItems.pending}
+					onClick={() => {
+						void allItems.run(async () => {
+							const res = await call<{ items: number; skins: number }>(
+								`/api/staff/players/${user.accountId}/give-all-items`,
+								{ authed: true, json: {} }
+							)
+							return `Gave @${user.username} ${res.items.toLocaleString()} items and ${res.skins.toLocaleString()} skins.`
+						})
+					}}
+				>
+					{allItems.pending ? 'Giving…' : 'Give all items and skins'}
+				</button>
 			</section>
 		</>
 	)

@@ -59,6 +59,7 @@ import {
 	CatalogKind,
 	getCatalogItem,
 	getCatalogItemById,
+	toCatalogAvatarItem,
 	toCatalogSkin,
 } from '../../econ/src/catalog-db'
 import { countConsumable, grantConsumable } from '../../econ/src/consumables-db'
@@ -1326,6 +1327,76 @@ async function findGiftableItem(db: D1Database, requested: string): Promise<Gift
 		default:
 			return null
 	}
+}
+
+/**
+ * Give a player EVERY avatar item and skin in the catalog. Written straight into their
+ * inventory (no gift boxes — thousands of them would bury the player), the same rows a
+ * purchase makes, so re-running it is harmless: owned items are refreshed, not doubled.
+ * Needs the `catalog` table loaded (the deploy does that when it is empty).
+ */
+export async function giveAllItemsHandler(c: Context<App>) {
+	const playerId = playerIdParam(c)
+	if (playerId === null) return c.json({ error: 'A numeric player id is required' }, 400)
+	if ((await getAccount(c.env.DB, playerId)) === null) {
+		return c.json({ error: 'No such player' }, 404)
+	}
+
+	const { results } = await c.env.DB.prepare(
+		'SELECT * FROM catalog WHERE kind IN (?1, ?2)'
+	)
+		.bind(CatalogKind.AvatarItem, CatalogKind.Skin)
+		.all<CatalogRow>()
+	if (results.length === 0) {
+		return c.json(
+			{ error: 'The item catalog is empty. Redeploy once so the deploy can load it.' },
+			409
+		)
+	}
+
+	const statements: D1PreparedStatement[] = []
+	let items = 0
+	let skins = 0
+	for (const row of results) {
+		if (row.kind === CatalogKind.AvatarItem) {
+			const item = toCatalogAvatarItem(row)
+			statements.push(
+				c.env.DB.prepare(
+					`INSERT INTO inventory (account_id, avatar_item_desc, data) VALUES (?1, ?2, ?3)
+					 ON CONFLICT (account_id, avatar_item_desc) DO UPDATE SET data = ?3`
+				).bind(playerId, item.AvatarItemDesc, JSON.stringify(item))
+			)
+			items++
+		} else {
+			const skin = toCatalogSkin(row)
+			const equipment = {
+				ModificationGuid: skin.ModificationGuid,
+				PrefabName: skin.PrefabName,
+				FriendlyName: skin.FriendlyName,
+				Tooltip: skin.Tooltip ?? '',
+				Rarity: skin.Rarity,
+				PlatformMask: -1,
+				Favorited: false,
+			}
+			// Keeps a skin's favourite flag if they already own it, like a re-purchase does.
+			statements.push(
+				c.env.DB.prepare(
+					`INSERT INTO equipment (account_id, equipment_modification_guid, data) VALUES (?1, ?2, ?3)
+					 ON CONFLICT (account_id, equipment_modification_guid) DO UPDATE SET
+					   data = json_set(?3, '$.Favorited',
+					     json(CASE WHEN json_extract(equipment.data, '$.Favorited') THEN 'true' ELSE 'false' END))`
+				).bind(playerId, equipment.ModificationGuid, JSON.stringify(equipment))
+			)
+			skins++
+		}
+	}
+	for (let i = 0; i < statements.length; i += 100) {
+		await c.env.DB.batch(statements.slice(i, i + 100))
+	}
+
+	await recordPlayerAudit(c, 'give_all_items', { playerId, items, skins })
+	logger.info('staff gave every item and skin', { moderatorId: staffId(c), playerId, items, skins })
+	return c.json({ items, skins })
 }
 
 /**

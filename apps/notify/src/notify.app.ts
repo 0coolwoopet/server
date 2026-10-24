@@ -315,10 +315,17 @@ const app = new Hono<App>()
 
 	// Send a coach/system direct message to every currently-online player.
 	.post('/internal/coach-message-all', async (c) => {
-		const body = await c.req.json<{ messageContent?: string }>().catch(() => null)
+		const body = await c.req
+			.json<{ messageContent?: string; fromPlayerId?: number }>()
+			.catch(() => null)
 		const content = typeof body?.messageContent === 'string' ? body.messageContent.trim() : ''
 		if (content === '') return c.json({ error: 'messageContent is required' }, 400)
-		const result = await hubCall(c, (hub) => hub.coachMessageAll(content))
+		// Optional sender; absent means the Coach.
+		if (body?.fromPlayerId !== undefined && !Number.isInteger(body.fromPlayerId)) {
+			return c.json({ error: 'fromPlayerId must be an integer' }, 400)
+		}
+		const fromPlayerId = body?.fromPlayerId ?? COACH_PLAYER_ID
+		const result = await hubCall(c, (hub) => hub.coachMessageAll(content, fromPlayerId))
 		return c.json({ success: true, ...result })
 	})
 
@@ -331,16 +338,20 @@ const app = new Hono<App>()
 	// notice, for something nobody needs to re-read.
 	.post('/internal/coach-message', async (c) => {
 		const body = await c.req
-			.json<{ playerId?: number; messageContent?: string }>()
+			.json<{ playerId?: number; messageContent?: string; fromPlayerId?: number }>()
 			.catch(() => null)
 		const content = typeof body?.messageContent === 'string' ? body.messageContent.trim() : ''
 		if (typeof body?.playerId !== 'number' || !Number.isInteger(body.playerId)) {
 			return c.json({ error: 'playerId is required' }, 400)
 		}
 		if (content === '') return c.json({ error: 'messageContent is required' }, 400)
+		// Optional sender; absent means the Coach.
+		if (body.fromPlayerId !== undefined && !Number.isInteger(body.fromPlayerId)) {
+			return c.json({ error: 'fromPlayerId must be an integer' }, 400)
+		}
 
 		const notification = await createNotification(c.env.DB, {
-			FromPlayerId: COACH_PLAYER_ID,
+			FromPlayerId: body.fromPlayerId ?? COACH_PLAYER_ID,
 			ToPlayerId: body.playerId,
 			Type: COACH_MESSAGE_TYPE,
 			Data: content,

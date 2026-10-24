@@ -650,9 +650,12 @@ const broadcastMaintenance = (startsInMinutes: number): Promise<{ delivered?: nu
 		authed: true,
 	})
 
-const coachMessageAll = (messageContent: string): Promise<{ sent?: number }> =>
+const coachMessageAll = (
+	messageContent: string,
+	fromPlayerId?: number
+): Promise<{ sent?: number }> =>
 	call<{ sent?: number }>(`${where().notify}/internal/coach-message-all`, {
-		json: { messageContent },
+		json: { messageContent, fromPlayerId },
 		authed: true,
 	})
 
@@ -663,10 +666,11 @@ const coachMessageAll = (messageContent: string): Promise<{ sent?: number }> =>
  */
 const coachMessage = (
 	playerId: number,
-	messageContent: string
+	messageContent: string,
+	fromPlayerId?: number
 ): Promise<{ delivered?: number; queued?: boolean }> =>
 	call<{ delivered?: number; queued?: boolean }>(`${where().notify}/internal/coach-message`, {
-		json: { playerId, messageContent },
+		json: { playerId, messageContent, fromPlayerId },
 		authed: true,
 	})
 
@@ -2952,8 +2956,6 @@ function StaffRoomTokens({ room }: { room: OwnedRoom }) {
 							`/api/staff/rooms/${room.RoomId}/gift-tokens`,
 							{ authed: true, json: { amount, message: message.trim() } }
 						)
-						setTokens('')
-						setMessage('')
 						const n = res.paid.length
 						const missed =
 							res.skipped.length > 0
@@ -4258,34 +4260,43 @@ function RoomCard({
  */
 function CoachMessageForm() {
 	const [recipient, setRecipient] = useState('')
+	const [sender, setSender] = useState('')
 	const [message, setMessage] = useState('')
 	const { pending, error, done, run } = useAction()
 	// The `@` is how the name is written, not part of it — accepted either way, shown back
 	// with it, and sent without it.
 	const handle = recipient.trim().replace(/^@/, '')
 	const toOne = handle !== ''
+	// Same rule for the sender; blank means the Coach itself.
+	const fromHandle = sender.trim().replace(/^@/, '')
 
 	return (
 		<section className="card">
 			<h2>Coach message</h2>
 			<p className="muted">
-				Send a message from the Coach to one player, or leave the recipient blank to send it to
-				every connected player. A broadcast reaches only who is online right now; a message to one
-				player waits for them if they aren&apos;t.
+				Send a message from the Coach (or from another player, via the From box) to one player, or
+				leave the recipient blank to send it to every connected player. A broadcast reaches only
+				who is online right now; a message to one player waits for them if they aren&apos;t.
 			</p>
 			<form
 				onSubmit={(e) => {
 					e.preventDefault()
 					void run(async () => {
 						const content = message.trim()
+						// Resolved up front so a name that matches nobody refuses before anything sends.
+						const fromId = fromHandle === '' ? undefined : await accountIdForUsername(fromHandle)
 						if (!toOne) {
-							const { sent } = await coachMessageAll(content)
+							const { sent } = await coachMessageAll(content, fromId)
 							setMessage('')
 							return `Sent to ${sent ?? 0} online player${sent === 1 ? '' : 's'}.`
 						}
 						// Resolved before sending: the workers address players by id, and a name that
 						// matches nobody should be a refusal rather than a message into the void.
-						const { queued } = await coachMessage(await accountIdForUsername(handle), content)
+						const { queued } = await coachMessage(
+							await accountIdForUsername(handle),
+							content,
+							fromId
+						)
 						setMessage('')
 						return queued === true
 							? `@${handle} is offline — it will arrive when they next connect.`
@@ -4293,6 +4304,15 @@ function CoachMessageForm() {
 					})
 				}}
 			>
+				<label>
+					From
+					<input
+						value={sender}
+						placeholder="@username — blank sends from the Coach"
+						autoComplete="off"
+						onChange={(e) => setSender(e.target.value)}
+					/>
+				</label>
 				<label>
 					Send to
 					<input
@@ -4470,8 +4490,6 @@ function TokenDropForm() {
 							authed: true,
 							json: { amount, message: message.trim() },
 						})
-						setTokens('')
-						setMessage('')
 						const n = res.paid.length
 						return `Sent ${amount.toLocaleString()} tokens to ${n} online player${n === 1 ? '' : 's'}.`
 					})
@@ -4546,8 +4564,6 @@ function RoleTokenDropForm() {
 							`/api/staff/discord-roles/${encodeURIComponent(role)}/gift-tokens`,
 							{ authed: true, json: { amount, message: message.trim() } }
 						)
-						setTokens('')
-						setMessage('')
 						const n = res.paid.length
 						return `Sent ${amount.toLocaleString()} tokens to ${n} player${n === 1 ? '' : 's'} holding role ${role}.`
 					})

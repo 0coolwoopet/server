@@ -622,9 +622,12 @@ export class NotificationsHub extends DurableObject<Env> {
 	 * it's a broadcast, so the Message has no per-recipient `ToPlayerId`. Returns how
 	 * many connected clients were messaged.
 	 */
-	async coachMessageAll(content: string): Promise<{ sent: number }> {
+	async coachMessageAll(
+		content: string,
+		fromPlayerId: number = COACH_PLAYER_ID
+	): Promise<{ sent: number }> {
 		const payload = this.buildNotificationPayload(NotificationType.MessageReceived, {
-			FromPlayerId: COACH_PLAYER_ID,
+			FromPlayerId: fromPlayerId,
 			Type: COACH_MESSAGE_TYPE,
 			Data: content,
 		})

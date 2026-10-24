@@ -79,6 +79,7 @@ import type { ReportRow, ReportSearch } from '../../api/src/reports-db'
 import type { CatalogRow } from '../../econ/src/catalog-db'
 import type {
 	BalanceResponsePayload,
+	GiftManualConsumedPayload,
 	GiftPackagePayload,
 	ModerationKickPayload,
 	PlayerProgressionLevelPayload,
@@ -1526,7 +1527,7 @@ export async function giveAllItemsHandler(c: Context<App>) {
 /**
  * Open ALL of a player's pending gift boxes at once. Opening a box only dismisses it (every
  * item was granted when the box was made), so this deletes the player's `received_gift` rows
- * and nothing else. Reports how many there were.
+ * and tells their game each one is gone. Reports how many there were.
  */
 export async function openAllBoxesHandler(c: Context<App>) {
 	const playerId = playerIdParam(c)
@@ -1534,15 +1535,39 @@ export async function openAllBoxesHandler(c: Context<App>) {
 	if ((await getAccount(c.env.DB, playerId)) === null) {
 		return c.json({ error: 'No such player' }, 404)
 	}
-	const row = await c.env.DB.prepare(
-		'SELECT count(*) AS n FROM received_gift WHERE account_id = ?1'
+	const { results: boxes } = await c.env.DB.prepare(
+		'SELECT id FROM received_gift WHERE account_id = ?1 ORDER BY id'
 	)
 		.bind(playerId)
-		.first<{ n: number }>()
-	const opened = row?.n ?? 0
+		.all<{ id: number }>()
 	await c.env.DB.prepare('DELETE FROM received_gift WHERE account_id = ?1').bind(playerId).run()
+
+	// Real time: tell the player's game each box is gone (`gift.manualconsumed`), so any box
+	// already on their screen closes now instead of waiting for a reload. Best-effort — the
+	// boxes are deleted either way, and the hub queues the frames for an offline player.
+	const frames: PlayerNotification[] = boxes.map((b) => ({
+		playerId,
+		notificationType: NotificationType.GiftManualConsumed,
+		data: { GiftPackageId: b.id } satisfies GiftManualConsumedPayload,
+	}))
+	const hub = c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE)
+	for (let i = 0; i < frames.length; i += GIVE_ALL_FRAMES_PER_CALL) {
+		try {
+			await hub.notifyPlayers(frames.slice(i, i + GIVE_ALL_FRAMES_PER_CALL))
+		} catch (err) {
+			logger.error('failed to announce the opened gift boxes', {
+				playerId,
+				announced: i,
+				boxes: frames.length,
+				error: err instanceof Error ? err.message : String(err),
+			})
+			break
+		}
+	}
+
+	const opened = boxes.length
 	await recordPlayerAudit(c, 'open_all_boxes', { playerId, opened })
-	logger.info('staff opened all of a player\'s gift boxes', {
+	logger.info("staff opened all of a player's gift boxes", {
 		moderatorId: staffId(c),
 		playerId,
 		opened,

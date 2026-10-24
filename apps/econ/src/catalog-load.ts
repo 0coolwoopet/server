@@ -552,3 +552,51 @@ export const subscriberPriceFor = (regular: number): number =>
  * build, `sf3-2025.json` (the 2025 store dump) after it.
  */
 export const LEGACY_CLIENT_BUILD = 20_230_414
+
+/**
+ * Where a first-party custom item's store thumbnail is served from: its first built save that
+ * names one, under the `avatar/` prefix this server keeps those images in (a name already
+ * prefixed is left alone). Null when no save names a thumbnail. Pure, so the storefront build
+ * and the worker's listing lookup agree on the key.
+ */
+export function customItemThumbnail(
+	saves: ReadonlyArray<{ BodyType?: number; ThumbnailFileName?: string | null }> | null | undefined
+): string | null {
+	const named = (saves ?? [])
+		.filter((s) => typeof s.ThumbnailFileName === 'string' && s.ThumbnailFileName !== '')
+		.sort((a, b) => (a.BodyType ?? 0) - (b.BodyType ?? 0))
+	const name = named[0]?.ThumbnailFileName
+	if (!name) return null
+	return name.startsWith('avatar/') ? name : `avatar/${name}`
+}
+
+/**
+ * Give every custom-item listing that names no thumbnail the one its item's saves carry.
+ * `records` are `CustomAvatarItem` exports (any later record for an id is ignored). A listing
+ * that already names one, or whose item has none, is left as it is. Returns how many it filled.
+ */
+export function fillCustomThumbnails(
+	listings: StoreListing[],
+	records: ReadonlyArray<{
+		CustomAvatarItemId: string
+		CurrentSaves?: Array<{ BodyType?: number; ThumbnailFileName?: string | null }> | null
+	}>
+): number {
+	const byId = new Map<string, string>()
+	for (const r of records) {
+		const key = r.CustomAvatarItemId.toLowerCase()
+		if (byId.has(key)) continue
+		const thumb = customItemThumbnail(r.CurrentSaves)
+		if (thumb !== null) byId.set(key, thumb)
+	}
+	let filled = 0
+	for (const listing of listings) {
+		const drop = listing.GiftDrop
+		if (!drop.CustomAvatarItemId || drop.ThumbnailImageName) continue
+		const thumb = byId.get(drop.CustomAvatarItemId.toLowerCase())
+		if (thumb === undefined) continue
+		drop.ThumbnailImageName = thumb
+		filled++
+	}
+	return filled
+}

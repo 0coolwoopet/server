@@ -1,4 +1,4 @@
-import { CatalogKind } from './catalog-load'
+import { CatalogKind, customItemThumbnail } from './catalog-load'
 
 import type { CatalogKindValue, StoreListing } from './catalog-load'
 
@@ -42,6 +42,8 @@ import type { CatalogKindValue, StoreListing } from './catalog-load'
 export {
 	buildCatalogLoad,
 	CATALOG_INSERT_COLUMNS,
+	customItemThumbnail,
+	fillCustomThumbnails,
 	CatalogKind,
 	listingKind,
 	type CatalogCollision,
@@ -291,10 +293,52 @@ export async function getStoreListings(db: D1Database, ids: number[]): Promise<S
 		.bind(JSON.stringify(unique))
 		.all<{ catalog_id: number; listing: string }>()
 	const byId = new Map(results.map((r) => [r.catalog_id, r.listing]))
-	return unique.flatMap((id) => {
+	const listings = unique.flatMap((id) => {
 		const listing = byId.get(id)
 		return listing === undefined ? [] : [JSON.parse(listing) as StoreListing]
 	})
+	await fillMissingCustomThumbnails(db, listings)
+	return listings
+}
+
+/**
+ * A custom-item listing that names no thumbnail is given the one its item's first save carries,
+ * read from `api`'s `custom_avatar_item`. Done at read time so a catalog loaded before the
+ * store file was fixed still serves the picture, with no reload. Best-effort: a listing whose
+ * item cannot be read stays as it was.
+ */
+async function fillMissingCustomThumbnails(db: D1Database, listings: StoreListing[]): Promise<void> {
+	const wanted = listings.filter((l) => l.GiftDrop.CustomAvatarItemId && !l.GiftDrop.ThumbnailImageName)
+	if (wanted.length === 0) return
+	try {
+		const { results } = await db
+			.prepare(
+				`SELECT custom_avatar_item_id AS id, json_extract(data, '$.CurrentSaves') AS saves
+				 FROM custom_avatar_item
+				 WHERE custom_avatar_item_id IN (SELECT value FROM json_each(?1))`
+			)
+			.bind(JSON.stringify(wanted.map((l) => l.GiftDrop.CustomAvatarItemId)))
+			.all<{ id: string; saves: string | null }>()
+		const byId = new Map(
+			results.map((r) => [r.id.toLowerCase(), customItemThumbnail(parseSaves(r.saves))] as const)
+		)
+		for (const l of wanted) {
+			const thumb = byId.get((l.GiftDrop.CustomAvatarItemId ?? '').toLowerCase())
+			if (thumb) l.GiftDrop.ThumbnailImageName = thumb
+		}
+	} catch {
+		// The table is another worker's; without it the listing is served as stored.
+	}
+}
+
+function parseSaves(saves: string | null): Array<{ BodyType?: number; ThumbnailFileName?: string | null }> {
+	if (saves === null) return []
+	try {
+		const parsed = JSON.parse(saves) as unknown
+		return Array.isArray(parsed) ? parsed : []
+	} catch {
+		return []
+	}
 }
 
 /**

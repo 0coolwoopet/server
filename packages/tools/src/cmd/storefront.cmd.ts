@@ -1,11 +1,12 @@
 import 'zx/globals'
 
-import { writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { Command } from '@commander-js/extra-typings'
 import Table from 'cli-table3'
 
 import {
 	collapseRepeatedListings,
+	fillCustomThumbnails,
 	GOLD_SKIN_PRICE,
 	isGoldSkin,
 	LEGACY_CLIENT_BUILD,
@@ -106,6 +107,12 @@ export const withStoreContext = (listing: StoreListing): StoreListing => ({
 const withoutSale = <T extends { StorefrontSaleData: unknown }>(prices: T[] | null): T[] | null =>
 	prices === null ? null : prices.map((p) => ({ ...p, StorefrontSaleData: null }))
 
+/** The first-party custom item exports, the same two files `runx admin cai-load` reads. */
+const CAI_EXPORTS = [
+	'apps/econ/static/db/2025-1-cai.json',
+	'apps/econ/static/db/studio87-extras.json',
+]
+
 const build = new Command('build')
 	.description('Write sf3-2025.json from the 2025 store dump')
 	.action(async () => {
@@ -143,6 +150,15 @@ const build = new Command('build')
 			if (item.GiftDrop.ThumbnailImageName !== '') blanked++
 			item.GiftDrop = { ...item.GiftDrop, ThumbnailImageName: '' }
 		}
+
+		// A custom item the dump gives no thumbnail takes the one its own saves carry (the
+		// first-party items the store sells are loaded from these exports, `just cai-load`).
+		const records = CAI_EXPORTS.flatMap((file) => {
+			const parsed = JSON.parse(readFileSync(file, 'utf8').replace(/^\uFEFF/, '')) as unknown
+			const list = Array.isArray(parsed) ? parsed : ((parsed as { Results?: unknown }).Results ?? [])
+			return list as Array<{ CustomAvatarItemId: string }>
+		})
+		const thumbnailed = fillCustomThumbnails(items, records)
 
 		// Gold skins at their prestige price, in tokens only, no discount.
 		let gold = 0
@@ -184,7 +200,7 @@ const build = new Command('build')
 				`✓ ${STOREFRONT_FILE}: ${items.length} listings from ${STORE_DUMP} ` +
 					`(${repeats} repeated listing(s) dropped, ${sales} sale(s) removed) ` +
 					`+ ${added} skin(s) from ${SKINS} at rarity ${UNLISTED_SKIN_RARITY}, ` +
-					`${blanked} skin/consumable thumbnail(s) blanked, ${gold} gold skin(s) at ${GOLD_SKIN_PRICE}, ` +
+					`${blanked} skin/consumable thumbnail(s) blanked, ${thumbnailed} custom item thumbnail(s) filled, ${gold} gold skin(s) at ${GOLD_SKIN_PRICE}, ` +
 					`${recontexted} drop(s) with Context ${NO_CONTEXT} set to ${STORE_CONTEXT}`
 			)
 		)

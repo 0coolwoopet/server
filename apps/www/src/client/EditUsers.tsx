@@ -407,14 +407,11 @@ function UserEditor({
 					</button>
 				</form>
 				<p className="hint">
-					Or unlock everything without any gift boxes, and clear the boxes they already have.
+					Or unlock everything without sending any gift boxes, or dismiss the boxes they already have.
 				</p>
-				{allItemsNoBoxes.error && <p className="error">{allItemsNoBoxes.error}</p>}
-				{allItemsNoBoxes.done && <p className="ok">{allItemsNoBoxes.done}</p>}
-				<button
-					type="button"
-					disabled={allItemsNoBoxes.pending}
-					onClick={() => {
+				<form
+					onSubmit={(e) => {
+						e.preventDefault()
 						void allItemsNoBoxes.run(async () => {
 							const res = await call<{
 								items: number
@@ -428,14 +425,15 @@ function UserEditor({
 						})
 					}}
 				>
-					{allItemsNoBoxes.pending ? 'Giving…' : 'Give all items (no boxes)'}
-				</button>
-				{openBoxes.error && <p className="error">{openBoxes.error}</p>}
-				{openBoxes.done && <p className="ok">{openBoxes.done}</p>}
-				<button
-					type="button"
-					disabled={openBoxes.pending}
-					onClick={() => {
+					{allItemsNoBoxes.error && <p className="error">{allItemsNoBoxes.error}</p>}
+					{allItemsNoBoxes.done && <p className="ok">{allItemsNoBoxes.done}</p>}
+					<button type="submit" disabled={allItemsNoBoxes.pending}>
+						{allItemsNoBoxes.pending ? 'Giving…' : 'Give all items (no boxes)'}
+					</button>
+				</form>
+				<form
+					onSubmit={(e) => {
+						e.preventDefault()
 						void openBoxes.run(async () => {
 							const res = await call<{ opened: number }>(
 								`/api/staff/players/${user.accountId}/open-all-boxes`,
@@ -445,8 +443,12 @@ function UserEditor({
 						})
 					}}
 				>
-					{openBoxes.pending ? 'Opening…' : 'Open all gift boxes'}
-				</button>
+					{openBoxes.error && <p className="error">{openBoxes.error}</p>}
+					{openBoxes.done && <p className="ok">{openBoxes.done}</p>}
+					<button type="submit" disabled={openBoxes.pending}>
+						{openBoxes.pending ? 'Opening…' : 'Open all gift boxes'}
+					</button>
+				</form>
 			</section>
 		</>
 	)

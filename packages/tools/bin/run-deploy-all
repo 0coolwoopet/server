@@ -1,0 +1,286 @@
+#!/bin/sh
+set -eu
+
+# One command that takes a fresh Cloudflare account (or an existing RecFlare one) to a fully
+# deployed server, from the repo root. This is what a push-to-deploy build should run:
+#
+#   pnpm run deploy
+#
+# Steps, all idempotent so it is safe to run on every push:
+#   1. create any missing Cloudflare resources (D1, KV, R2, Secrets Store + secrets)
+#   2. build, apply D1 migrations
+#   3. deploy `notify` and `auth` first (other workers bind to them), then everything else
+#
+# Workers go on the default workers.dev URLs unless RECFLARE_DOMAIN is a custom domain.
+# Needs CLOUDFLARE_API_TOKEN (+ CLOUDFLARE_ACCOUNT_ID if the token sees several accounts).
+# RECFLARE_BOOTSTRAP=off skips step 1 and uses RECFLARE_D1 / RECFLARE_KV /
+# RECFLARE_SECRETS_STORE exactly as given.
+
+ROOT=$(git rev-parse --show-toplevel)
+cd "$ROOT"
+. "$ROOT/packages/tools/src/sh/env.sh"
+recflare_load_env
+
+# --- tools the build image might lack -------------------------------------------------
+if ! command -v jq >/dev/null 2>&1; then
+	echo "jq not found, fetching a static copy"
+	mkdir -p "$HOME/.local/bin"
+	curl -fsSL -o "$HOME/.local/bin/jq" \
+		"https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64"
+	chmod +x "$HOME/.local/bin/jq"
+	PATH="$HOME/.local/bin:$PATH"
+	export PATH
+fi
+
+recflare_resolve_domain
+if [ -z "${RECFLARE_DOMAIN:-}" ]; then
+	echo "error: couldn't work out your workers.dev subdomain." >&2
+	echo "  Set RECFLARE_DOMAIN=<your-subdomain>.workers.dev (Cloudflare dashboard > Workers & Pages," >&2
+	echo "  the subdomain shown there), or make CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID available." >&2
+	exit 1
+fi
+export RECFLARE_DOMAIN
+echo "Base domain: $RECFLARE_DOMAIN"
+
+# On workers.dev the site (www) is served from <account>.workers.dev under the Worker name
+# `server`, the one a Workers Builds project is created with. An explicit
+# RECFLARE_SUBDOMAINS (even "{}") wins over this default.
+case "$RECFLARE_DOMAIN" in
+*.workers.dev)
+	if [ -z "${RECFLARE_SUBDOMAINS+x}" ]; then
+		RECFLARE_SUBDOMAINS='{"www":"server"}'
+		export RECFLARE_SUBDOMAINS
+	fi
+	;;
+esac
+
+# --- GitHub-backed storage (instead of R2, which needs a payment method) ----------------
+# Turned on by giving the build a GITHUB_STORAGE_TOKEN (a GitHub personal access token with
+# read/write on the repo's contents), and optionally RECFLARE_GITHUB_STORAGE_REPO=owner/repo.
+# With only the token, the repo defaults to <token owner>/recflare-storage, created private
+# if it doesn't exist. Leave both unset to use R2 as before.
+if [ -n "${GITHUB_STORAGE_TOKEN:-}" ] || [ -n "${RECFLARE_GITHUB_STORAGE_REPO:-}" ]; then
+	if [ -z "${GITHUB_STORAGE_TOKEN:-}" ]; then
+		echo "error: RECFLARE_GITHUB_STORAGE_REPO is set but GITHUB_STORAGE_TOKEN is not" >&2
+		exit 1
+	fi
+	gh() { curl -sS -H "Authorization: Bearer $GITHUB_STORAGE_TOKEN" -H "Accept: application/vnd.github+json" "$@"; }
+	if [ -z "${RECFLARE_GITHUB_STORAGE_REPO:-}" ]; then
+		gh_login=$(gh https://api.github.com/user | jq -r '.login // empty')
+		if [ -z "$gh_login" ]; then
+			echo "error: GITHUB_STORAGE_TOKEN was rejected by GitHub (or can't read your profile). Set RECFLARE_GITHUB_STORAGE_REPO=owner/repo explicitly." >&2
+			exit 1
+		fi
+		RECFLARE_GITHUB_STORAGE_REPO="$gh_login/recflare-storage"
+	fi
+	status=$(gh -o /dev/null -w '%{http_code}' "https://api.github.com/repos/$RECFLARE_GITHUB_STORAGE_REPO")
+	if [ "$status" = "404" ]; then
+		echo "Creating private GitHub repo $RECFLARE_GITHUB_STORAGE_REPO"
+		created=$(gh -o /dev/null -w '%{http_code}' -X POST https://api.github.com/user/repos \
+			-d "{\"name\":\"${RECFLARE_GITHUB_STORAGE_REPO#*/}\",\"private\":true,\"auto_init\":true,\"description\":\"RecFlare object storage\"}")
+		if [ "$created" != "201" ]; then
+			echo "error: couldn't create $RECFLARE_GITHUB_STORAGE_REPO (HTTP $created). Create it by hand, or give the token permission to create repos." >&2
+			exit 1
+		fi
+	elif [ "$status" != "200" ]; then
+		echo "error: can't access GitHub repo $RECFLARE_GITHUB_STORAGE_REPO (HTTP $status). The token needs Contents read/write on it." >&2
+		exit 1
+	fi
+	export RECFLARE_GITHUB_STORAGE_REPO
+fi
+
+# wrangler isn't a root dependency; borrow the copy installed for a worker.
+wr() { pnpm --silent --dir "$ROOT/apps/notify" exec wrangler "$@"; }
+# wrangler prints a banner before some output; keep from the first JSON bracket on.
+json_only() { sed -n '/^[[{]/,$p'; }
+
+# --- 1. resources ---------------------------------------------------------------------
+bootstrap() {
+	D1_NAME=recflare
+	KV_BINDINGS="RECFLARE_MATCH_PRESENCE RECFLARE_PLAYER_SETTINGS"
+	R2_BUCKETS="recflare-cdn recflare-img"
+	STORE_NAME=recflare
+
+	if [ -z "${RECFLARE_D1:-}" ]; then
+		RECFLARE_D1=$(wr d1 list --json | json_only | jq -r --arg n "$D1_NAME" '.[] | select(.name == $n) | .uuid' | head -1)
+		if [ -z "$RECFLARE_D1" ]; then
+			echo "Creating D1 database $D1_NAME"
+			wr d1 create "$D1_NAME" >/dev/null
+			RECFLARE_D1=$(wr d1 list --json | json_only | jq -r --arg n "$D1_NAME" '.[] | select(.name == $n) | .uuid' | head -1)
+		fi
+		export RECFLARE_D1
+	fi
+
+	if [ -z "${RECFLARE_KV:-}" ]; then
+		kv_json='{}'
+		for b in $KV_BINDINGS; do
+			id=$(wr kv namespace list | json_only | jq -r --arg t "$b" '.[] | select(.title == $t) | .id' | head -1)
+			if [ -z "$id" ]; then
+				echo "Creating KV namespace $b"
+				wr kv namespace create "$b" >/dev/null
+				id=$(wr kv namespace list | json_only | jq -r --arg t "$b" '.[] | select(.title == $t) | .id' | head -1)
+			fi
+			kv_json=$(printf '%s' "$kv_json" | jq -c --arg k "$b" --arg v "$id" '. + {($k): $v}')
+		done
+		RECFLARE_KV=$kv_json
+		export RECFLARE_KV
+	fi
+
+	if [ -n "${RECFLARE_GITHUB_STORAGE_REPO:-}" ]; then
+		echo "Storage: GitHub repo $RECFLARE_GITHUB_STORAGE_REPO (R2 not used)"
+	else
+		existing_buckets=$(wr r2 bucket list 2>/dev/null || true)
+		for bucket in $R2_BUCKETS; do
+			if ! printf '%s\n' "$existing_buckets" | grep -q "$bucket"; then
+				echo "Creating R2 bucket $bucket"
+				wr r2 bucket create "$bucket" >/dev/null
+			fi
+		done
+	fi
+
+	if [ -z "${RECFLARE_SECRETS_STORE:-}" ]; then
+		find_store() {
+			wr secrets-store store list --remote 2>/dev/null | grep -F "$STORE_NAME" |
+				grep -oE '[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1 || true
+		}
+		RECFLARE_SECRETS_STORE=$(find_store)
+		if [ -z "$RECFLARE_SECRETS_STORE" ]; then
+			echo "Creating Secrets Store $STORE_NAME"
+			wr secrets-store store create "$STORE_NAME" --remote >/dev/null
+			RECFLARE_SECRETS_STORE=$(find_store)
+		fi
+		if [ -z "$RECFLARE_SECRETS_STORE" ]; then
+			echo "error: couldn't find or create the Secrets Store. Create it by hand and set RECFLARE_SECRETS_STORE." >&2
+			exit 1
+		fi
+		export RECFLARE_SECRETS_STORE
+	fi
+
+	# Secrets are only ever created when missing, never overwritten, and never printed.
+	existing_secrets=$(wr secrets-store secret list "$RECFLARE_SECRETS_STORE" --remote 2>/dev/null || true)
+	if ! printf '%s\n' "$existing_secrets" | grep -q 'JWT_SECRET'; then
+		echo "Creating JWT_SECRET"
+		wr secrets-store secret create "$RECFLARE_SECRETS_STORE" --name JWT_SECRET --scopes workers --remote \
+			--value "$(openssl rand -hex 32)" >/dev/null
+	fi
+	if [ -n "${RECFLARE_GITHUB_STORAGE_REPO:-}" ] && ! printf '%s\n' "$existing_secrets" | grep -q 'GITHUB_STORAGE_TOKEN'; then
+		echo "Creating GITHUB_STORAGE_TOKEN"
+		wr secrets-store secret create "$RECFLARE_SECRETS_STORE" --name GITHUB_STORAGE_TOKEN --scopes workers --remote \
+			--value "$GITHUB_STORAGE_TOKEN" >/dev/null
+	fi
+	# www's Turnstile bindings must resolve for it to deploy. Missing ones are created as
+	# placeholders (or from TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY if set), never
+	# overwritten. Web signup is off unless PASSWORD_SIGNUP is on, and a placeholder keypair
+	# can't pass Turnstile's verdict, so this opens nothing. Put the real keys in the Secrets
+	# Store (or set the two env vars before the first deploy) to enable signup.
+	for ts in TURNSTILE_SITE_KEY TURNSTILE_SECRET_KEY; do
+		if ! printf '%s\n' "$existing_secrets" | grep -q "$ts"; then
+			echo "Creating $ts (placeholder unless $ts is set; web signup needs the real Turnstile key)"
+			ts_val=$(printenv "$ts" || true)
+			wr secrets-store secret create "$RECFLARE_SECRETS_STORE" --name "$ts" --scopes workers --remote \
+				--value "${ts_val:-placeholder-not-configured}" >/dev/null
+		fi
+	done
+	if ! printf '%s\n' "$existing_secrets" | grep -q 'META_APP_SECRET'; then
+		echo "Creating META_APP_SECRET (placeholder unless META_APP_SECRET is set; Meta sign-in needs the real one)"
+		wr secrets-store secret create "$RECFLARE_SECRETS_STORE" --name META_APP_SECRET --scopes workers --remote \
+			--value "${META_APP_SECRET:-placeholder-not-configured}" >/dev/null
+	fi
+}
+
+if [ "${RECFLARE_BOOTSTRAP:-on}" != "off" ]; then
+	bootstrap
+fi
+
+# --- 2. build + migrate ---------------------------------------------------------------
+pnpm turbo build
+
+for dir in apps/*/; do
+	dir=${dir%/}
+	if jq -e '.scripts.migrate' "$dir/package.json" >/dev/null 2>&1; then
+		echo "Migrating $(basename "$dir")"
+		(cd "$dir" && pnpm run migrate)
+	fi
+done
+
+# runx is written for bun, which the build image doesn't ship; npm can fetch it.
+ensure_bun() {
+	if ! command -v bun >/dev/null 2>&1; then
+		echo "bun not found, installing it for runx"
+		npm install --silent --no-audit --no-fund --prefix "$HOME/.runx-bun" bun
+		PATH="$HOME/.runx-bun/node_modules/.bin:$PATH"
+		export PATH
+	fi
+}
+
+# --- store contents -------------------------------------------------------------------
+# Migrations only create the tables. What the store SELLS lives in two of them that no
+# migration fills — econ's `catalog` (the listings) and api's `custom_avatar_item` (the
+# first-party items) — and is loaded by `runx catalog load` / `runx admin cai-load`. Skipping
+# that leaves the store empty while the backpack (the player's own inventory) still works.
+# Both loads merge and are safe to repeat; they only run when a table is empty, so a normal
+# push doesn't rewrite thousands of rows. RECFLARE_RELOAD_CATALOG=1 forces a reload (after
+# changing the storefront JSON); RECFLARE_LOAD_CATALOG=off skips this step.
+if [ "${RECFLARE_LOAD_CATALOG:-on}" != "off" ]; then
+	ensure_bun
+
+	table_rows() {
+		bun -e "import { execSql } from './packages/tools/src/d1'; const r = await execSql('SELECT COUNT(*) AS n FROM $1', true, '$2'); console.log('ROWS=' + (r.results[0]?.n ?? 0))" |
+			sed -n 's/^ROWS=//p' | tail -1
+	}
+
+	# An empty or unreadable count means "load it"; only a positive count skips.
+	needs_load() { [ "${RECFLARE_RELOAD_CATALOG:-}" = "1" ] || ! [ "$(table_rows "$1" "$2" 2>/dev/null || true)" -gt 0 ] 2>/dev/null; }
+
+	if needs_load catalog econ; then
+		echo "Loading the store catalog"
+		bun packages/tools/src/bin/runx.cmd.ts catalog load --remote
+	fi
+	if needs_load custom_avatar_item api; then
+		echo "Loading the first-party custom avatar items"
+		bun packages/tools/src/bin/runx.cmd.ts admin cai-load --remote
+	fi
+fi
+
+# --- staff accounts -------------------------------------------------------------------
+# RECFLARE_STAFF_ACCOUNT_IDS="2" (space or comma separated) gives those accounts full staff:
+# developer, moderator and Studio (the `betastudio` role the website's staff list is built
+# from). Idempotent, so it can stay set. Takes effect on the player's next sign-in, because
+# the roles are stamped into the token when it is minted. An id with no account yet is skipped
+# with a warning (sign up first, then redeploy) rather than failing the deploy. Setting it is
+# the explicit act of handing out staff: nothing is granted by default.
+if [ -n "${RECFLARE_STAFF_ACCOUNT_IDS:-}" ]; then
+	ensure_bun
+	for id in $(printf '%s' "$RECFLARE_STAFF_ACCOUNT_IDS" | tr ',' ' '); do
+		case "$id" in
+		*[!0-9]* | '')
+			echo "warning: ignoring staff account id '$id' (not a number)" >&2
+			continue
+			;;
+		esac
+		for grant in grant-developer grant-moderator grant-studio; do
+			bun packages/tools/src/bin/runx.cmd.ts admin "$grant" --account "$id" --remote ||
+				echo "warning: $grant for account $id didn't apply (does the account exist yet?)" >&2
+		done
+	done
+fi
+
+# --- 3. deploy ------------------------------------------------------------------------
+deploy_one() { (cd "$ROOT/apps/$1" && pnpm run deploy); }
+
+# notify owns the Durable Object most workers bind to; www binds auth as a service.
+for first in notify auth; do
+	deploy_one "$first"
+done
+
+others=$(for dir in apps/*/; do n=$(basename "$dir"); case "$n" in notify | auth) ;; *) echo "$n" ;; esac; done)
+failed=0
+# A handful at a time: wrangler is memory-hungry and these are 25+ workers.
+printf '%s\n' $others | xargs -P 4 -I{} sh -c 'cd "$1/apps/{}" && pnpm run deploy' _ "$ROOT" || failed=1
+
+if [ "$failed" -ne 0 ]; then
+	echo "error: one or more workers failed to deploy (see above)" >&2
+	exit 1
+fi
+
+echo "Done. Discovery document: https://ns.$RECFLARE_DOMAIN/"

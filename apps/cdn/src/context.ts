@@ -1,0 +1,33 @@
+import type { HonoApp } from '@repo/hono-helpers'
+import type { SharedHonoEnv, SharedHonoVariables } from '@repo/hono-helpers/src/types'
+
+export type Env = SharedHonoEnv & {
+	// Shared Secrets Store binding for the HS256 JWT signing key. Resolve the value
+	// with `await env.JWT_SECRET.get()`; all workers bind the same store so tokens
+	// signed by `auth` verify here.
+	JWT_SECRET: SecretsStoreSecret
+	// Shared `recflare` database, read-only here. Studio bundle downloads check that
+	// `unity_asset` records the requested filename (which is the R2 key) before
+	// streaming it. The rooms worker owns that table's migration; this binding has no
+	// migrations_dir.
+	DB: D1Database
+	// R2 bucket holding CDN binaries: signature blobs under `sigs/<name>` and
+	// room build data under `room/<name>`.
+	CDN_ASSETS: R2Bucket
+	// Static-asset fetcher for the JSON configs in `static/config/` (see wrangler.jsonc
+	// `assets`). Fetched by filename so `/config/:name` serves whatever is published;
+	// the binding is the only way in, since `run_worker_first` keeps the runtime from
+	// serving the files directly.
+	ASSETS: Fetcher
+	// Optional upstream CDN origin (e.g. https://cdn.recflare.net). When set, an R2 miss is
+	// proxied from it and written through to R2. Empty/unset = local bucket only.
+	UPSTREAM_CDN_URL?: string
+}
+
+/** Variables can be extended */
+export type Variables = SharedHonoVariables
+
+export interface App extends HonoApp {
+	Bindings: Env
+	Variables: Variables
+}

@@ -1,0 +1,66 @@
+import type { HonoApp } from '@repo/hono-helpers'
+import type { SharedHonoEnv, SharedHonoVariables } from '@repo/hono-helpers/src/types'
+// Type-only import (erased at build) of the DO class owned by the `notify`
+// worker, so the cross-worker RPC stub is fully typed.
+import type { NotificationsHub } from '../../notify/src/notifications-hub'
+
+export type Env = SharedHonoEnv & {
+	// Shared Secrets Store binding for the HS256 JWT signing key. Resolve the value
+	// with `await env.JWT_SECRET.get()`; all workers bind the same store so tokens
+	// signed by `auth` verify here.
+	JWT_SECRET: SecretsStoreSecret
+	/**
+	 * Base domain the share-link URL is derived from, e.g. `rec.example.com`.
+	 * Injected at deploy time via `--var DOMAIN`; defaults in `wrangler.jsonc`
+	 * for local dev and tests.
+	 */
+	DOMAIN: string
+	/** The `SUBDOMAINS` JSON injected for every worker at deploy time; a `www` override moves the share-link host. */
+	SUBDOMAINS?: string
+	/** Maximum accepted size of each API-owned image upload, in bytes. */
+	RECFLARE_MAX_API_UPLOAD_BYTES?: string
+	/**
+	 * The client builds `/api/versioncheck/v4` answers "current" for, as a comma-separated
+	 * list of builds (`20230414,20250718`), or `off` for none. Unset means the default
+	 * `SUPPORTED_GAME_VERSIONS` in @repo/domain. Set for every worker from the root `.env`
+	 * (`RECFLARE_SUPPORTED_GAME_VERSIONS`), so `auth` refuses a token to exactly the builds
+	 * this flags for an update. Read through `supportedGameBuilds`, which also folds in
+	 * every build under rollout (below).
+	 */
+	SUPPORTED_GAME_VERSIONS?: string
+	/**
+	 * The builds under staged rollout (`RECFLARE_ROLLOUT_GAME_VERSIONS`), same format;
+	 * `off` ends the rollout. Unset means the default `ROLLOUT_GAME_VERSIONS` in
+	 * @repo/domain. A rollout build is always "current" here — it is `auth` that decides who
+	 * may sign in on it — so the version check never sends a supporter to update.
+	 */
+	ROLLOUT_GAME_VERSIONS?: string
+	// Shared rooms database (schema/migrations owned by the `rooms` worker). Used
+	// read-only here to resolve room roles for `/api/rooms/v1/verifyRole`.
+	DB: D1Database
+	// Image bucket (shared with the `img` worker, which serves objects back by
+	// key). Uploaded saved images are written here.
+	IMAGES: R2Bucket
+	// Shared CDN bucket (owned by the `cdn` worker, written by `storage`). Read
+	// here only to hash an invention's uploaded data blob under `invention/`.
+	CDN_ASSETS: R2Bucket
+	/**
+	 * The per-player settings map the `playersettings` worker owns (`player:<id>` → JSON
+	 * `{ key: value }`). Read and written here by
+	 * `GET|PUT /api/players/v1/playerPhotoTaggingSetting`: the photo-tagging preference is
+	 * one key (`playerPhotoTaggingSetting`) in that shared bag, not a store of its own, so
+	 * the write MERGES — see `writePhotoTaggingSetting`.
+	 */
+	RECFLARE_PLAYER_SETTINGS: KVNamespace
+	// SignalR notifications hub (DO owned by the `notify` worker). Bound here to
+	// push RelationshipChanged notifications when a player's relationship changes.
+	RECFLARE_NOTIFICATIONS_HUB: DurableObjectNamespace<NotificationsHub>
+}
+
+/** Variables can be extended */
+export type Variables = SharedHonoVariables
+
+export interface App extends HonoApp {
+	Bindings: Env
+	Variables: Variables
+}

@@ -1,0 +1,664 @@
+# econ
+
+Economy Worker served on the `econ` subdomain (`econ.recflare.net`). Hosts the
+avatar/economy endpoints the game client calls on the `econ` service (distinct from the
+main `api` worker, which also serves many of them — the client may call either host).
+
+Balances, inventory, consumables, saved outfits, avatars, gift boxes, weekly-challenge
+progress and game-reward eligibility are D1-backed; storefront catalogs and the weekly-challenge rotation are static
+assets (`static/`), the storefronts served via the ASSETS binding. Several routes are still
+empty-list stubs.
+
+## Routes
+
+`✓` = auth-gated (validates the Bearer JWT from the `auth` worker; empty-body 401 when
+missing/invalid). `~` = optional auth: served to anyone, personalised for a valid bearer.
+
+| Method   | Path                                                 | Auth | Description                             |
+| -------- | ---------------------------------------------------- | ---- | --------------------------------------- |
+| GET      | `/api/avatar/v1/defaultunlocked`                     |      | Default-unlocked avatar items (static)  |
+| GET      | `/api/avatar/v1/defaultbaseavataritems`              |      | Default base avatar items (stub `[]`)   |
+| GET      | `/api/avatar/v4/items`                               | ✓    | Owned items + the default catalog       |
+| GET      | `/econ/customAvatarItems/v1/owned`                   | ✓    | Owned custom avatar items (stub)        |
+| GET      | `/api/objectives/v1/myprogress`                      |      | Objectives progress (static)            |
+| GET/POST | `/api/objectives/v1/cleargroup`                      |      | Clear an objectives group (no-op `[]`)  |
+| GET      | `/api/avatar/v2`                                     | ✓    | The player's own avatar                 |
+| POST     | `/api/avatar/v2/set`                                 | ✓    | Save the player's avatar                |
+| GET      | `/api/checklist/v1/current`                          | ✓    | NUX checklist (stub `[]`)               |
+| GET      | `/api/itemWishlists/v1/wishlist/me`                  | ✓    | The caller's item wishlist              |
+| GET      | `/api/itemWishlists/v1/wishlist/:accountId`          | ✓    | Another player's item wishlist          |
+| POST     | `/api/itemWishlists/v1/wishlist/add`                 | ✓    | Wish for an item (form, enveloped)      |
+| POST     | `/api/itemWishlists/v1/wishlist/remove`              | ✓    | Un-wish an item (a POST, not DELETE)    |
+| POST     | `/api/itemWishlists/v1/isonwishlist/bulk`            | ✓    | Per-player "has it wished for" booleans |
+| GET      | `/api/avatar/v3/saved`                               | ✓    | Saved outfits                           |
+| POST     | `/api/avatar/v3/saved/set`                           | ✓    | Save an outfit into a slot              |
+| GET      | `/api/avatar/v2/gifts`                               | ✓    | Pending (unopened) gift boxes           |
+| POST     | `/api/avatar/v2/gifts/consume`                       |      | Open a gift box → success envelope      |
+| GET      | `/api/avatar/v2/:id`                                 |      | Another player's avatar (render subset) |
+| GET      | `/api/equipment/v2/getUnlocked`                      |      | Unlocked equipment (stub `[]`)          |
+| GET      | `/api/roomconsumables/v1/roomConsumable/room/:id`    |      | Room consumables (stub `[]`)            |
+| GET      | `/api/roomconsumables/v1/roomConsumable/room/:id/me` |      | Caller's room consumables (stub `[]`)   |
+| GET      | `/api/roomcurrencies/v1/currencies`                  |      | Room currencies (stub `[]`)             |
+| GET      | `/api/roomcurrencies/v1/getAllBalances`              |      | Room balances (stub `[]`)               |
+| POST     | `/api/settings/v2/set`                               | ✓    | Persist settings (accept-and-ack)       |
+| GET      | `/api/consumables/v2/getUnlocked`                    | ✓    | Unlocked consumables                    |
+| POST     | `/api/consumables/v1/consume`                        | ✓    | Consume an owned consumable             |
+| POST     | `/api/consumables/v1/updateActive`                   | ✓    | Mark a consumable active (stub, empty)  |
+| GET      | `/api/storefronts/v4/balance/:currencyType`          | ✓    | Currency balance                        |
+| GET      | `/api/storefronts/v3/giftdropstore/:id`              |      | Gift-drop storefront catalog            |
+| POST     | `/api/storefronts/v2/buyItem`                        | ✓    | Buy a storefront item                   |
+| POST     | `/api/items/bulkpurchase`                            | ✓    | Buy a bag of storefront items           |
+| GET      | `/api/storefronts/v1/adcarouselitems`                |      | Ad-carousel items (static)              |
+| GET      | `/api/challenge/v2/getCurrent`                       | ~    | Weekly rotation + the caller's progress |
+| POST     | `/api/challenge/v2/updateProgress`                   | ✓    | Report challenge progress               |
+| GET      | `/api/gamerewards/v1/pending`                        |      | Pending game rewards (stub `[]`)        |
+| POST     | `/api/gamerewards/v1/request`                        | ✓    | Claim a game reward → 10 XP + gift box  |
+| GET      | `/api/roomkeys/v1/mine`                              |      | The player's room keys (stub `[]`)      |
+| GET      | `/api/roomkeys/v1/room`                              |      | The keys a room has listed              |
+| POST     | `/api/roomkeys/v1/create`                            | ✓    | List a key for a room (owner/co-owner)  |
+| PUT      | `/api/roomkeys/v1/updateAll`                         | ✓    | Edit one key (owner/co-owner)           |
+| GET      | `/api/storefronts/v1/buyRoomKey`                     | ✓    | Buy a room key; pays the room owner     |
+| POST     | `/api/storefronts/v1/PurchaseRoomKeyWithCurrency`    | ✓    | Buy a room key with its room currency   |
+| POST     | `/api/roomCurrencies/v2/purchase`                    | ✓    | Buy room currency with tokens (offer)   |
+| POST     | `/api/CampusCard/v1/UpdateAndGetSubscription`        | ~    | Gold year for `developer`s, else `{}`   |
+| GET      | `/openapi.json`                                      |      | Generated OpenAPI 3.1 spec (see below)  |
+
+The app runs with `strict: false`, so trailing-slash variants match (the client posts
+`/gifts/consume/` with a trailing slash).
+
+## API documentation
+
+`GET /openapi.json` serves a spec generated from `describeRoute` blocks alongside each
+handler, with the schemas in `src/openapi.ts`. **Descriptive, not enforced** — same
+rationale as the `auth`/`accounts`/`match` workers. A test asserts every route appears
+in the spec, so adding one without documenting it fails.
+
+## Purchases (`buyItem`)
+
+The core flow. The client posts the storefront/item ids, the currency, and the
+`RequestedPrice` it rendered; the handler:
+
+1. looks the item up in `static/storefronts/sf{StorefrontType}.json`;
+2. rejects a stale price (`409`) — this stops a stale or tampered client buying at a
+   price the catalog no longer offers;
+3. debits the buyer **atomically** (`400` on insufficient balance);
+4. grants the drop — an avatar item into the `inventory` table (own-once), equipment into
+   `equipment`, a consumable into `consumable` (each buy stacks a new instance), or, for a
+   query drop, whatever the roll lands on (below); currency/xp drops aren't granted yet;
+5. returns a **gift box** and pushes a `StorefrontBalanceUpdate` over the socket.
+
+Two things are easy to get wrong:
+
+- **`Balance` in the response is the _change_ applied** (the negated price), not the
+  resulting total. The client reads its new total from `GET /balance/:type`.
+- **Ownership is persisted at purchase**, not when the box is opened. Opening a box
+  (`/gifts/consume`) just deletes it — the item was already granted. So the grant never
+  waits on the cosmetic "open it" moment.
+
+A `Gift` block routes the item (and box) to another player, but the caller always pays.
+A self-buy or anonymous gift is attributed to the "Coach" system account (id 1).
+
+### The shopping bag (`POST /api/items/bulkpurchase`)
+
+The same purchase, many items at once. The client posts every line in the bag — an item id,
+`DuplicateItemCount` copies, the unit `RequestedPrice` it rendered, an optional `Gift` — plus
+the one `StorefrontType` and one `CurrencyType` they all share.
+
+**The response is not buyItem's.** It is `{ Success, Error, error_id, Value }` — `error_id`
+lowercase because the client renames that one member, the other three PascalCase — wrapping a
+BalanceUpdateResponse:
+
+```jsonc
+{
+  "Success": true,
+  "Error": null,
+  "error_id": null,
+  "Value": {
+    "Balance": 9500, // the RESULTING total, not buyItem's change
+    "CurrencyType": 2,
+    "Platform": -2, // the bucket that total belongs to — a renamed BalanceType
+    "BalanceUpdates": [
+      // one entry per REQUESTED item, in request order
+      {
+        "UpdateResponse": 0,
+        "Data": { "GiftPackage": { … }, "PurchasableItemId": 2182, "CustomAvatarItem": null },
+      },
+    ],
+  },
+}
+```
+
+What is deliberate here:
+
+- **`Value.Balance` is the resulting total**, unlike buyItem's change — `{ Balance,
+CurrencyType, Platform }` is the BalanceResponse triple a `StorefrontBalance*` frame also
+  carries, and the one frame this pushes reports the identical number, so body and frame
+  agree instead of compounding.
+- **`Platform` is `-2`, not the capture's `4`.** It is the client's `BalanceType` under a
+  `[DataMember]` rename — the bucket, not a store. The reference server said `RecNetPurchased`
+  because it kept a wallet per store; this server keeps ONE account-wide bucket and the client
+  SUMS its buckets, so naming any other platform invents a second balance beside the real one
+  — the bug that showed a player 34,100 tokens.
+- **One entry per REQUESTED item, and `UpdateResponse` is where it reports.** A line that
+  didn't sell comes back non-OK with a null `GiftPackage`, and `AllowPartialSuccess` is what
+  lets those sit beside successful ones while `Success` stays true. Codes: 0 OK,
+  1 TooManyRequests, 2 NotEnoughCredit, 3 AlreadyOwned, 4 NoItemAvailable,
+  5 CouponNotApplicable, 6 RequestedPriceDoesNotMatch, 7 RequestedAmountNotAllowed,
+  8 PlayerNotEligible, 9 RequestCannotBeRefunded, 10 PlayerNotApproved. This server can
+  produce 0/2/4/5/6/7; the rest are rate limiting, entitlements and refunds, none of which
+  exist here. `AlreadyOwned` is left unused on purpose — buyItem lets a player re-buy what
+  they own, and one purchase path refusing what the other allows would be worse than either.
+- **One entry per item means one box per item.** So `DuplicateItemCount` above 1 is only
+  allowed for a consumable (they stack, and the count rides on the one box);
+  anything owned once is refused with `RequestedAmountNotAllowed` rather than charged twice
+  for a grant that would collapse into itself.
+- **One catalog read and one debit for the whole bag.** Lines resolve in memory against a
+  single `sf{N}.json` read (sf3 is 1161 items; the cap is 200 copies), and the total is spent
+  in ONE atomic `spendCurrency`. Charging line by line would let a bag half-succeed against a
+  concurrent spend and would push a balance frame per line.
+- **Nothing sold ⇒ a refusal, not an empty success.** `Success: false`, the first failure's
+  reason in `Error`, and a null `Value` — legal here, since the client's validator only
+  cascades into a non-null one (unlike the matchmaking DTO, which throws on a null payload).
+  Without `AllowPartialSuccess`, one bad line refuses the bag the same way and nothing is
+  charged. `400` is reserved for a request that can't be evaluated at all (no lines, a
+  non-spendable currency, more than `Econ.BulkPurchaseCap` — the same 200 the client reads
+  from its game config), and even those answer the envelope.
+- **`GiftPackage` is its own 20-key DTO**, not the stored box: buyItem's `Data` entry plus
+  `PlayerId` / `CustomAvatarItemId` / `Signature` / `IsSignatureValid`, minus its `Level`.
+  Its `Platform`/`PlatformsToSpawnOn` are the platform MASK (-1) — the balance bucket is the
+  `BalanceType` beside them, which is the opposite arrangement from `Value.Platform` above.
+  `Signature` is null and `IsSignatureValid` false: a box the server minted was never signed
+  for peer-to-peer transfer.
+- **`BypassGiftPackages` skips the boxes, not the grant.** Ownership never depended on the
+  box, so the items are granted either way; `GiftPackage` is then null — exactly what the
+  captured response shows.
+- **Guid-keyed ids and coupons are refused.** `ItemPurchaseMethodId` is a discriminated id
+  (`Type` 0 = a storefront `PurchasableItemId` in `NumberId`; a `Guid` names a UGC item no
+  catalog here sells, and `Data.PurchasableItemId` is null for it), and nothing issues the
+  coupon a `CouponConsumablePlayerMappingId` would spend.
+
+## Query drops — the loot boxes (`IsQuery`)
+
+A gift-drop with `IsQuery: true` is not an item, it is a **roll**: all of its item fields
+(`AvatarItemDesc`, `EquipmentModificationGuid`, `ConsumableItemDesc`) are empty on purpose,
+and what the player gets is picked at grant time. sf2's tooltip states the rule outright —
+_"A random 4-star item that you don't have."_ Eight ship in the catalogs, two families of
+the same ladder:
+
+| sf2 "Star Boxes" (`ItemSetId` 44, `Unique`) | Rarity | sf3 "Random box" family |
+| ------------------------------------------- | ------ | ----------------------- |
+| —                                           | 0      | Common Random box       |
+| 2-Star Unique Box                           | 10     | Uncommon Random box     |
+| 3-Star Unique Box                           | 20     | Rare Random box         |
+| 4-Star Unique Box                           | 30     | Epic Random box         |
+| —                                           | 50     | Legendary Random box    |
+
+That table is the **star ↔ rarity ladder** (`STAR_RARITY` in `econ.app.ts`): sf2's three
+boxes pin 2/3/4 → 10/20/30 by carrying both their name and their `QueryRedirectRarity`, and
+sf3's five-name ladder fills in the ends. It's the same tier list twice, so read a rarity
+number in either dialect.
+
+`rollQueryDrop` resolves one inside `grantGiftDrop`, so both faucets — a purchase and the
+weekly gift — hand over a real item rather than an unopenable box:
+
+- **The pool is sf3**, the general store (`ROLL_STOREFRONT_TYPE`). It's the only catalog
+  with a real pool at every tier (1161 items against 8–40 in the themed ones), it's where
+  the Random box family itself sells, and "a random 4-star item" means the item universe,
+  not whichever seasonal shelf the box came off.
+- **Filtered to what the player doesn't own**, which is the `Unique` promise and the only
+  reading of "an item you don't have" that means anything.
+- **Avatar items and equipment only.** Other query drops are excluded (a box that rolls a
+  box), and so are consumables: they stack, so "don't have" never becomes false and they'd
+  crowd out the real prizes.
+- **`avatarItemsOnly` narrows it to worn items**, dropping equipment skins from the pool.
+  Level-up boxes use it; storefront boxes don't, since "a random 4-star item" means both.
+- **`QueryRedirectRarity` wins over `Rarity`** when present — sf2 carries both and they
+  agree; sf3's boxes carry only `Rarity`.
+- **An empty pool grants nothing** (logged `query gift-drop rolled nothing`) — an owner of
+  every 4-star item still gets the box, just nothing in it.
+- **`buyItem` answers with the ROLLED item, not the box.** The client draws the purchase
+  from `BalanceUpdates[0].Data[0]`, and a query drop's own item fields are all empty — echo
+  those and the player sees an empty box for a purchase that actually granted something. The
+  stored box was always correct; only the response was wrong.
+
+## Consume envelopes
+
+Both consume routes (`/gifts/consume`, `/consumables/consume`) always answer HTTP 200
+with `{ error: "", success: true, value: null }` — even for a missing or already-gone
+target. A captured real consume returns this envelope, not an empty body: the client
+parses it to finish the action, so a bare 200 reads as a failure and the item never
+finishes unlocking. Deletes are scoped to the caller, so an unauthenticated or
+mismatched call is a harmless no-op (opening _another_ player's box is a 403).
+
+## Weekly challenge (`src/challenge-rotation.ts`)
+
+Served by `GET /api/challenge/v2/getCurrent` (with each challenge's per-player `Complete`
+and `Config` stamped in — see Progress below). The server never evaluates the rules: the
+client reads the rule tree in each challenge's `Config`, watches its own gameplay, and posts
+the tree back to `/api/challenge/v2/updateProgress` with its verdict. So a rotation is the
+entire definition of a week's challenges — ids, display strings, matching rules and the
+reward preview.
+
+**Rotations are generated from the calendar week, not authored.** `buildRotation(now)` in
+`src/challenge-rotation.ts` derives everything from the week index: five challenges drawn
+from a pool of rooms crossed with the challenge kinds each room supports, the week's window,
+and a `ChallengeMapId` of `1000 + weekIndex`. It is a pure function of which week it is, and
+that is load-bearing rather than tidy — `challenge_status` rows are scoped by
+`ChallengeMapId` and the gift threshold counts completions against `Challenges`, so two
+callers who disagreed about what the week holds would disagree about who had finished it.
+Selection runs off a seeded PRNG (mulberry32 over the week index); nothing calls
+`Math.random()`.
+
+The week rolls at **Wednesday 21:00 UTC**, the boundary both captured rotations sit on,
+counted from an epoch of 2020-01-01. Each week publishes five challenges, no room twice and
+at most two of any one kind, so a week is never five variations of "finish some games".
+
+| Kind    | Asks for                                 | Target | Rooms                                   |
+| ------- | ---------------------------------------- | ------ | --------------------------------------- |
+| `games` | Finished games in one room               | 5      | Head-to-head and score-based rooms      |
+| `win`   | One finished game, won (or quest closed) | 1      | Quests, plus rooms with a real opponent |
+| `ai`    | Enemies defeated in one room             | 10     | Quests — the rooms with enemies in them |
+
+`static/weekly-challenge.json` still ships and still **wins**: a non-empty `Challenges` array
+there pins the week to that hand-authored rotation and skips generation entirely, which is
+how a debug or event week gets served without a code change. Empty (as shipped), it supplies
+only what generation doesn't own — `CompletedRequired`, `FallbackGiftName` and
+`ChallengeThemeString`, plus the `Gift` block used as a fallback if the catalog can't be read.
+
+Everything below was read off reference data (one captured live rotation), not a spec.
+Field meanings marked _(inferred)_ are read from how the values line up with the strings the
+client renders; the rest are pinned by the data itself. The field notes describe both the
+generated rotation and the pinned file, since they are the same shape on the wire.
+
+### Top level
+
+| Field                  | Example                        | Notes                                                                                                                                                                                                                                                                         |
+| ---------------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ChallengeMapId`       | `1347`                         | Id of the rotation as a whole ("map" of challenges). Echoed back on `updateProgress`. Generated as `1000 + weekIndex`; the four-digit floor keeps it clear of hand-authored ids (17, 19), which would otherwise read a player's old rows as progress against a different set. |
+| `CompletedRequired`    | `false`                        | _(inferred)_ All-or-nothing: `true` makes the `Gift` need every challenge, `false` the three-of-five threshold below.                                                                                                                                                         |
+| `StartAt` / `EndAt`    | `2026-03-25T21:00:00`          | The window, 7 days apart, **no timezone suffix** — unlike `ServerTime`. Treat as UTC.                                                                                                                                                                                         |
+| `ServerTime`           | `2026-03-31T14:42:54.2754728Z` | .NET round-trip timestamp (7-digit fraction, `Z`). The client dates the countdown off this. Generated rotations send the REAL clock — see below.                                                                                                                              |
+| `Challenges`           | array                          | The week's challenges, rendered in order.                                                                                                                                                                                                                                     |
+| `Gift`                 | object                         | The reward preview for finishing the set.                                                                                                                                                                                                                                     |
+| `FallbackGiftName`     | `"4-Star Box"`                 | Shown when the client can't resolve `Gift` into a name.                                                                                                                                                                                                                       |
+| `ChallengeThemeString` | a designer quote               | Free text carried through from the captured rotation; a theme note, not a rendered UI string as far as we can tell.                                                                                                                                                           |
+
+**The clock:** a generated rotation's window is genuinely the current week, so `ServerTime`
+is simply now and the countdown the client draws is real — the challenges expire on Wednesday
+at 21:00 UTC and the next week's set replaces them.
+
+That is the thing generation fixes. A **pinned** rotation is static, so its `ServerTime` has
+to be _frozen_ inside `StartAt`…`EndAt` — a day before the end is the captured shape (Mar 31
+inside Mar 25 → Apr 1) — or the client renders the week as already over. Move the window on a
+pinned rotation and you must move `ServerTime` into it too.
+
+### A challenge entry
+
+| Field         | Notes                                                                                                                                                                                                                                                           |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ChallengeId` | Unique within the rotation, not sequential (`37, 38, 44, 49, 63`). Posted back on `updateProgress`. Generated ids are the index of the (room, kind) pair in the generator's candidate list, so id 12 is always the same challenge — append rooms, never insert. |
+| `Name`        | Internal slug, never displayed — and **not authoritative**: `63` is named `Complete3SpillwayGames` but its `Config` and description are Clearcut. Trust `Config`, not the name.                                                                                 |
+| `Config`      | The rule tree, as an **escaped JSON string** (not a nested object). See below.                                                                                                                                                                                  |
+| `Description` | The one-line goal, e.g. `"Complete 10 games in ^Paintball"`.                                                                                                                                                                                                    |
+| `Tooltip`     | The longer hint under it.                                                                                                                                                                                                                                       |
+| `Complete`    | Per-player state, so always `false` as generated — `getCurrent` overwrites it per caller from `challenge_status`, along with `Config`.                                                                                                                          |
+
+`^Token` in `Description`/`Tooltip` is a client-side room link: the client resolves the
+token to a room and renders a tappable name. Subrooms use a dotted path
+(`^Paintball.Clearcut`). It is optional decoration, not markup the client requires — the
+same rotation writes both `"Complete 10 games in ^Paintball"` and, plainly,
+`"Complete 3 games of Paintball: Clear Cut"`.
+
+### The `Config` rule tree
+
+An escaped JSON string holding a tree of nodes, each with a numeric type in `ct`: a
+**Match** (`ct: 0`, `wc` is a list of predicates that must all hold for one game result) or
+a **Counter** (`ct: 1`, `ctc` is the child node to count and `t` the target). Leaves match a
+scene allow-list (`ct: 7`, subroom `UnitySceneId`s) or a session variable (`ct: 9`, e.g.
+`won`). The server never evaluates any of it — the client does, and posts the tree back with
+its own count written in.
+
+**Reading or writing one? See `.agents/skills/weekly-challenge-config/SKILL.md`** — the full
+node-type enum, the event types and session variables a predicate can match, the named scene
+constants (including the shared scenes that make a challenge complete in more rooms than you
+meant — `Soccer` and `Stadium` are one scene), the three idioms, and an authoring checklist.
+
+### The `Gift` block
+
+Same item vocabulary as a storefront `GiftDrop` (`AvatarItemDesc` — a comma-separated list
+of avatar-item guids, `AvatarItemType`, `ConsumableItemDesc`, `EquipmentPrefabName`,
+`EquipmentModificationGuid`) plus `Xp`, `Level` and `StorefrontType`, but two fields are
+**renamed**: a storefront's `Context`/`Rarity` are `GiftContext`/`GiftRarity` here. Don't
+feed one shape to the other's reader.
+
+**Weekly rewards are equipment**, so a generated week rolls one from sf3 — every item there
+carrying an `EquipmentModificationGuid` (187 of its 1161), drawn with the week's own seed.
+Drawing from the live catalog rather than a copied list is what lets the grant path resolve
+the pick back to the entry selling it, so the player receives a properly named item; the
+block a generated week emits carries that entry's `GiftDropId` and rarity.
+
+`EquipmentModificationGuid` is sometimes the Rec Room packed guid — 22-char URL-safe base64
+of the 16 guid bytes in .NET little-endian order, padding stripped (`g5u0weNLmkCLeUXFUVn74Q` →
+`c1b49b83-4be3-409a-8b79-45c55159fbe1`) — and sometimes a plain guid; sf3 carries both forms
+and they are matched as opaque strings, never converted. The reward is identified by prefab +
+that guid, _not_ by `GiftDropId`: the captured block's `GiftDropId` is `3994`, while the same
+skin sells in `sf3.json` as `2121` ("Camera Skin (Comic)").
+
+**Granted when the set is finished** — see below. The grant path is `buyItem`'s, so the
+block is translated into a storefront gift-drop first (`toChallengeGiftDrop`); the renamed
+`GiftContext`/`GiftRarity` are exactly what that translation is for.
+
+The block carries no display strings (and the captured one carries a `GiftRarity` of `0` for
+an item that sells at rarity `5`), so both are taken from the catalog entry selling the same
+item, matched on equipment guid / avatar desc — the reward reads as "Camera Skin (Comic)",
+not as the box it might have arrived in. An explicit `FriendlyName`/`Tooltip` on the block
+wins over the catalog if a pinned rotation sets them; neither is present in the captured one
+or in a generated block.
+
+**`FallbackGiftName` is the other half of the reward, not just a label.** "4-Star Box" is
+what the player gets _instead_ when they already own the item — the real game phrased it
+"…or a 4-Star Box!" — so it is granted as a query drop (a roll) at the tier its star count
+names, via the ladder in the query-drop section. Renaming it to `3-Star Box` retunes the
+consolation tier with no code change; a name that doesn't parse falls back to 4 stars.
+
+### Winning the gift (`challenge_gift`)
+
+There is no claim endpoint and the client never asks: the reward is handed out from the
+`updateProgress` call that reaches the threshold. Every completing report on the **live**
+rotation re-reads the caller's completions and, once enough of the week's own challenges are
+there, grants the `Gift` the way a purchase grants a drop — the item into
+`inventory`/`equipment`/`consumable`, plus a gift box (message
+`Weekly challenge complete!`) the player finds in `GET /api/avatar/v2/gifts`.
+
+**Three of five, not five of five** (`CHALLENGES_REQUIRED_FOR_GIFT`). A week publishes five
+challenges and the gift is for playing most of them, so the two a player can't reach — a
+quest they don't own, a mode they don't like — don't sink the whole week. The count is of
+challenges the rotation still **publishes**: a live client can report an id an edited
+rotation no longer lists, and three of those shouldn't buy a gift nobody worked for. A
+rotation publishing fewer than three can only ask for what it has.
+
+**The item, or a roll.** If the player already owns the `Gift`'s item — likely, since the
+rotation's reward is one fixed item that sells in the store — they get the
+`FallbackGiftName` box instead, rolled at its star tier. Finishing the week can't be worth
+nothing. A `Gift` block carrying no ownable item at all (no avatar desc, no equipment guid)
+counts as "already owned", so a rotation whose reward is _only_ a box is written by leaving
+the block empty and naming the tier.
+
+- **`challenge_gift` makes it happen once.** One row per (account, rotation); the row's
+  existence _is_ the grant. The client keeps reporting after the set is finished, so the
+  insert is the gate: `ON CONFLICT … DO NOTHING … RETURNING` claims it in one statement, and
+  a second report returns no row and grants nothing.
+- **Claim first, grant second** — at-most-once. If the grant then fails the reward is lost
+  rather than doubled; it's logged (`failed to grant weekly challenge gift`) and re-granted
+  by hand if it ever happens. A faucet that sticks is easier to spot than one that leaks.
+- **The response is unchanged; the socket carries the news.** `updateProgress` answers the
+  same four fields whether or not a gift was won, and a `GiftPackageReceivedImmediate` (31)
+  frame goes out over the hub with the box — that's what pops the reward panel the moment
+  the set is finished, instead of the player finding it on the next read of the gifts list.
+  The payload is the reference server's field-for-field (`Id`, `FromGiftDropId: 0`,
+  `FromPlayerId`, the item fields, `Platform`/`PlatformsToSpawnOn: -1`, `BalanceType: -2`,
+  `Message`), and it names the **rolled** item when the fallback box is what was granted.
+  `Immediate` (31) rather than `GiftPackageReceived` (30) is what the reference sends for a
+  box the server hands over unasked; the sender is Coach (1). Best-effort — a hub failure is
+  logged and swallowed, since the gift is already granted and stored.
+- **`CompletedRequired: true` makes the rotation all-or-nothing** — the threshold becomes
+  every published challenge. That reading of the flag is still _inferred_ (it is `false` in
+  the captured rotation, which is the partial default), but it's the one its name and the
+  three-of-five rule agree on.
+- **`Xp`/`Level` on the block are ignored**, as on a purchase — same gap, and both are `0`
+  in the captured rotation.
+- **A report against an old rotation never wins anything**, and an empty `Challenges` array
+  earns nothing (its threshold clamps to zero, which every player would otherwise meet
+  without playing).
+- **Players already past the threshold when this shipped still get it**: the client
+  re-reports completed challenges, and the first such report is a completing report.
+
+### Progress (`challenge_status`)
+
+`POST /api/challenge/v2/updateProgress` (auth-gated) upserts one row per (account,
+challenge) into `challenge_status`, and `getCurrent` reads them back to stamp each
+challenge's `Complete` **and `Config`**. The body is
+`{ ChallengeMapId, ChallengeId, Config, Complete }` with the ids as **strings** and
+`Complete` as .NET's `"True"`/`"False"` — capitalized, so `Boolean(body.Complete)` reads
+"not complete" as complete (`parseBool` handles both spellings and a real JSON `true`).
+
+**The client does the evaluating, and `Config` is its scratchpad.** It walks the rule tree
+locally and posts that tree back with its own progress written into the nodes — `cc` on a
+counter is the running count, `c` marks a satisfied node — so the posted tree is per-player
+state, not a copy of the catalog, and it is stored. `getCurrent` then serves the static
+challenge with the stored `Config` and `Complete` overwritten onto it; serving the pristine
+authored tree instead (what this used to do) threw away partial progress on every login. The
+server still evaluates none of the tree.
+
+The response is the four posted fields, except `Complete` and `Config` are the **stored**
+values rather than the posted ones, because:
+
+- **Completion latches within a rotation.** The client reports repeatedly, and a later
+  report saying "not complete" (a fresh session, a retry arriving out of order) must not
+  un-finish something already finished.
+- **A report carrying no `Config` keeps the stored tree.** `config` itself doesn't latch —
+  it's a tally, so the newest tree wins — but a report without one is missing data, not a
+  reset, and must not blank the progress.
+- **A new rotation resets the row.** Challenge ids are only unique within a rotation, so
+  the same id in a later week would otherwise start out already complete, and half-counted.
+  A report whose `ChallengeMapId` differs from the stored one replaces the row instead of
+  latching; reads are scoped to the rotation for the same reason.
+
+`getCurrent`'s auth is **optional** — an unauthenticated caller gets the static rotation
+with every `Complete` false and every `Config` as authored, rather than a 401, since the
+rotation is public and a failure on this route can stall the client's load. A challenge the
+caller has never reported keeps its authored `Config` too (a stored `NULL`), since a client
+handed a null tree has nothing to evaluate. The overlay rebuilds the response object rather
+than stamping the imported JSON in place: that import is module state shared across every
+request an isolate serves, so mutating it would leak one player's progress to the next
+caller.
+
+## Game rewards (`reward_status`)
+
+The client asks for a reward whenever it thinks one is due, posting a form body of the type
+and the message to show for it:
+
+```
+rewardType=FirstActivityOfDay&Message=First%20Game%20of%20the%20Day
+rewardType=PostGameActivity&Message=Activity%20completed%21&giftContext=Soccer
+```
+
+Since the client asks rather than the server offering, whether a reward is actually **owed**
+is decided here, from `reward_status` — one row per (account, reward type, gift context)
+holding the last claim and a count. One claim per type per activity per hour
+(`REWARD_COOLDOWN_MS`) — except `FirstActivityOfDay`, which is one per PLAYER per rolling
+24h (`DAILY_REWARD_COOLDOWN_MS`): it is always claimed on the `''` context, whichever
+activity asked, so its row's `granted_at` is simply the player's last one.
+
+- **The claim is one SQL statement** (`ON CONFLICT … DO UPDATE … WHERE`). The client fires
+  these off right after a match, so two can land together; a read-then-write would let both
+  see the same stale `granted_at` and pay out twice.
+- **A rejected claim leaves `granted_at` alone.** If an on-cooldown ask pushed the timestamp
+  forward, a client that retries in a loop would never become eligible.
+- **`giftContext` (the activity, e.g. `Soccer`) is part of the key** for the hourly types,
+  so a player who moves from Soccer to Paintball is owed another reward while a second Soccer
+  match inside the hour is not. The prize is still picked from the `giftContext` that asked,
+  `FirstActivityOfDay` included.
+- **A contextless ask keys on `''`, not NULL.** SQLite allows — and does not dedupe — NULLs
+  in a non-INTEGER primary key, so a NULL context would insert a fresh row on every ask
+  instead of hitting the conflict, and the cooldown would never apply. Migration
+  `0013_reward_status_gift_context.sql` rebuilds the table (SQLite can't add a column to a
+  primary key) and lands the pre-existing rows on that same `''` bucket, so cooldowns from
+  before it keep counting.
+
+**What a claim pays: 10 XP, in a gift box.** The XP (`GAME_REWARD_XP`) is banked in
+`progression` and the box is the wrapper the client shows for it — no item, every item field
+empty, `GiftContext` 50 (`GameRewards`). The box wears the `Message` the client posted
+(`First Game of the Day`), and a `GiftPackageReceivedImmediate` frame goes out with it, the
+same push the weekly-challenge gift uses. XP is banked **before** the box is created, so a
+failure can't leave a box promising XP nobody was credited.
+
+- **One flat amount for every reward type.** Pricing `FirstActivityOfDay` differently from
+  `PostGameActivity` is a map keyed by type.
+- **Exactly an early level.** Each of the first three levels costs 10 XP, so a fresh
+  player's first rewards each level them up; from level 4 (20 XP a level) it takes two or
+  more, and the daily XP cap paces it from there.
+- **`PostGameActivity`/`PostQuestActivity` pay 250 tokens, up to 1,250 a day**
+  (`GAME_REWARD_TOKENS`, `GAME_REWARD_DAILY_TOKEN_CAP`) — per player, whatever the
+  `giftContext`. `FirstActivityOfDay` pays 250 more OUTSIDE that cap — its own once-a-day
+  claim already limits it, so it has no allowance row. The running total
+  is one row per player in `reward_status` under the reserved type `$tokens` (context `''`):
+  `grant_count` is the TOKENS paid in the window and `granted_at` when the window opened.
+  `claimAllowance` adds to it in one atomic upsert, refusing a grant that would cross the cap
+  (all or nothing, so the cap is a multiple of the amount), and resets it in place once the
+  window is 24h old — a rolling window, so no time zone's midnight decides it. The tokens are
+  credited to the RecCenterTokens balance (`StorefrontBalanceUpdate` with the resulting total)
+  and arrive in a **second box** of their own — `GiftContext` 51 (`GameRewardsTokens`),
+  `Currency` 250, no XP — after the reward's, so the player sees what they were for.
+- **XP is capped too: 150 a day** (`GAME_REWARD_DAILY_XP_CAP`), fifteen claims' worth, on the
+  same machinery — the player's `$xp` row, `grant_count` the XP paid in the window. Every
+  type's XP draws on it but `FirstActivityOfDay`'s, a bonus on top like its tokens. Past the
+  cap a claim still counts against its cooldown and still pays its activity's item (in a box
+  with `Xp` 0) and its tokens; a claim with nothing left to carry gets no box at all.
+- **The response stays `[]`.** It's what the client already accepts, and the reward is
+  delivered as a box, so there's nothing to put in the body. The reference answers its own
+  (different) flow with `{ error, success, value: null }`, not a list of rewards.
+- **An on-cooldown ask pays nothing** — no XP, no box, no frame. That's the whole point of
+  getting eligibility right first: a client that retries in a loop must not mint boxes.
+
+**Progression (`progression`) is shared.** `econ` writes it here; `api` reads it back for
+`GET /api/players/v{1,2}/progression/…`. It lives in `@repo/domain` for that reason, the
+same split as gift boxes. A player with no row reads as level 1 / 0 XP, so a GET never
+inserts.
+
+**Levelling spends the XP.** `xp` is progress into the current level, not a lifetime total:
+`addXp` adds the grant, then walks the ladder in `LEVEL_REQUIRED_XP`, subtracting each
+level's cost while it's covered — so a big enough grant can cross several levels at once.
+The ladder steps 10 → 20 → 45 → 115 → 360 → 1080 every ten levels and stops at 50, so the
+first level costs 10 XP and the last costs a hundred times that.
+
+That table is copied from the `LevelProgressionMaps` the client is served in
+`apps/api/static/api-config-v2.json`, and **both sides have to agree** or the bar fills to a
+different mark than the level-up fires at; an `api` test asserts they stay identical.
+
+It is also the real game's curve, checked against Rec Room's own published level chart —
+cumulative XP to finish a level: 170 by 10, 620 by 20, 1,770 by 30, 5,370 by 40, 16,170 by 50. Nearly flat to level 20, then a knee at 30–40 and a steep climb to the cap; a third of
+the whole grind sits in the last ten levels. A test pins those milestones, since per-level
+costs are easy to edit one at a time and hard to eyeball as a curve.
+
+**Every level pays out a reward**, from Rec Room's published level-reward table
+(`LEVEL_REWARDS` in `@repo/domain`) — per level, not per band:
+
+| Levels           | Reward                                     |
+| ---------------- | ------------------------------------------ |
+| 1, 3, 5, 6, 7, 9 | Consumable                                 |
+| 2, 4, 8, 10 – 21 | 2-Star Clothing (rarity 10)                |
+| 22 – 30          | 3-Star on even levels, 2-Star between      |
+| 31 – 39          | 3-Star, with 4-Star at 31 and 35           |
+| 40 – 49          | 4-Star Clothing (rarity 30)                |
+| 50               | 5-Star Clothing (rarity 50) — the only one |
+
+**One reward per level crossed** — a grant spanning several levels pays each of them. In
+practice a 10 XP game reward crosses at most one, so the first reward a fresh player claims
+hands over two boxes: the XP reward itself and the 2-Star Clothing for reaching level 2. Each
+arrives as a gift box announced like any other (`Level 2!`).
+
+- **"Clothing" is why the roll passes `avatarItemsOnly`** — the prize has to be something the
+  player can wear and be seen in, never an equipment skin for a weapon they may not own.
+- **Consumable levels don't roll a rarity.** The table names no star tier for them, and
+  consumables stack, so there's no ownership filter either — a second Confetti Cannon is a
+  fine prize. It's picked as a concrete drop rather than through the query path.
+- **This table is not the served config's `GiftRarity`.** That one is a coarse per-band tier
+  (flat 10 to level 14, 20 to 39, 30 to 49, 50 at the cap) with no notion of consumables, and
+  the two disagree — level 15 is 2-Star in the published table and 20 in the config. We grant
+  from the published table; the config is left as captured, so the drift test asserts only
+  the XP costs. If the client previews an upcoming reward from `GiftRarity`, aligning the two
+  is an edit to the static config.
+- The reference server carries the config data and never reads it: granting anything for a
+  level is ours.
+
+**The client is told, or it shows nothing.** A grant pushes `PlayerProgressionLevelUpdate`
+(`{ PlayerId, Level, XP }`) — without it the bar sits still until something else refreshes
+it, which is what "levelling does nothing" looks like from the game. `api`'s
+`GET /api/players/v1/progression/:id` pushes the same frame on read, as the reference does,
+so a client that just connected gets its bar right.
+
+**Not ported:** the reference's `request` doesn't grant at all — it offers **three** drops,
+pushes a `RewardSelectionReceived` frame and waits for `POST /api/gamerewards/v1/select` to
+grant the one the player picked. We grant on request instead, so there is no selection state
+and no `/select`. It also caps activity XP per day (`daily_xp_ledgers`); the hourly cooldown
+is our cap.
+
+`GET /api/gamerewards/v1/pending` stays `[]`: with rewards claimed on request, nothing sits
+waiting to be collected.
+
+## Discord supporter gift (`src/discord-role-gift.ts`)
+
+A cron (`triggers.crons` in `wrangler.jsonc`) hands every account holding a mapped Discord
+role that role's RecCenterTokens in a gift box, every time it fires. The map is the
+`DISCORD_ROLE_TOKENS` var — `RECFLARE_DISCORD_ROLE_TOKENS` in the root `.env`, see
+`.env.example` — as `<roleId>=<tokens>` pairs separated by commas:
+
+```
+928457923857943795=2500,2938479238479234=10000
+```
+
+- **The schedule is the cadence.** It ships weekly (Monday 05:00 UTC); make it daily by
+  changing the cron line. There is no ledger and no notion of a period in the code — every
+  run pays everyone it finds, so running it twice pays twice, and a hand run is an extra
+  gift on purpose.
+- **One box per account per run, the highest amount wins.** An account holding both roles
+  above gets one box of 10,000, not two boxes or 12,500, so the map reads as tiers however
+  Discord stacks the roles. A role named twice keeps its last amount; an entry that isn't
+  `digits=positive integer` is logged and skipped, not fatal. No roles at all — unset, empty,
+  all rejected — leaves the cron a logged no-op.
+- **Roles come from `platform_account.role`**, the snapshot `www`'s benefits claim writes and
+  its daily role sweep (04:30 UTC, with a bot token) refreshes. This cron never asks Discord
+  anything, which is why the default fires half an hour after that sweep. A player who has
+  never claimed on the website has no link and is never paid, whatever they hold in the guild.
+- **The grant is econ's usual three moves**: seed the signup grant (`STARTING_TOKENS`), credit
+  the balance, store a token box from the Coach (context 0, `AvatarItemType` null), then
+  push `StorefrontBalanceUpdate` with the resulting total and `GiftPackageReceivedImmediate`
+  for the box. An offline player finds the box on their next `GET /api/avatar/v2/gifts`.
+- A grant that fails partway is logged with the account, role and amount and is not retried —
+  a retry that also failed partway is how a balance gets credited twice.
+- **The first link is paid on demand.** `www`'s benefits claim calls `grantDiscordRoleGift`
+  — one account, the roles Discord just served, the same map and box — the first time an
+  account links its Discord, so a new supporter gets one box now rather than after the next
+  run. `www` decides "first" from the link table; this module keeps no ledger either way, and
+  the cron pays that account again on its next run like everyone else.
+- **A whole run can be paid by hand.** `www`'s staff panel ("Bonus reward!", developer-only,
+  `POST /api/staff/discord-roles/supporter-gift`) calls `grantDiscordRoleGifts` with its own
+  bindings — the same map, audience and box as the cron — and answers with the run's summary.
+  No ledger here either: it pays everyone again on top of the schedule, which is the point.
+
+One D1 read for the links, then a handful of writes and two hub calls per box, sequentially.
+A cron invocation has a fixed subrequest budget (50 free, 1000 paid); a community whose
+supporters outgrow that is the point to batch the run.
+
+## Bindings
+
+| Binding                      | Type           | Notes                                                      |
+| ---------------------------- | -------------- | ---------------------------------------------------------- |
+| `DB`                         | D1             | Shared `recflare` database — balances, inventory, XP, etc. |
+| `JWT_SECRET`                 | Secrets Store  | Shared HS256 signing key (see the `auth` README)           |
+| `ASSETS`                     | static assets  | Serves `sf{N}.json` storefront catalogs                    |
+| `RECFLARE_NOTIFICATIONS_HUB` | Durable Object | Cross-worker RPC to the `notify` worker's hub              |
+| `STARTING_TOKENS`            | var            | Optional; new-player token grant (default in balance-db)   |
+| `DISCORD_ROLE_TOKENS`        | var            | Optional; Discord role → token gift per cron run (above)   |
+
+Add a storefront by dropping a new `sfN.json` in `static/storefronts` — no code change.
+
+## Known gaps
+
+- Gifting to another player grants the item and box but does not notify the recipient — the
+  reference sends `GiftPackageReceivedImmediate` there too (`buy.go`, when the body carries
+  a `Gift`), and `pushGiftReceived` is now sitting right there to do it.
+- `buyItem` grants avatar-item, equipment, consumable and query (box) drops; currency/xp
+  drops aren't granted.
+- A query drop rolls uniformly across the tier and can't run at a rarity sf3 doesn't
+  publish; per-item weighting and a multi-catalog pool would both need a manifest of the
+  storefronts, which the ASSETS binding can't enumerate.
+- Consumables are granted and listed but never spent by gameplay, so `Count` only grows.
+- Several routes (equipment, room consumables/currencies) are empty-list stubs pending
+  their own stores.
+- Game rewards pay a flat 10 XP, capped at 150 a day (the reference caps activity XP per day
+  in `daily_xp_ledgers`).
+- The level-reward table and the served config's `GiftRarity` disagree in places (see the
+  level section); we grant from the table and leave the config as captured, so a client that
+  previews an upcoming reward would preview the config's answer, not ours.

@@ -1,0 +1,542 @@
+/**
+ * Player presence — the room instance a player is currently in, plus the status
+ * fields the match heartbeat echoes back. Stored on the shared `recflare` D1 with
+ * the same JSON-blob pattern as the rooms/room_instance tables: the full presence
+ * is a JSON blob in `data`, and the fields we query on (account_id,
+ * room_instance_id, room_id, expires_at) are SQLite generated (virtual) columns
+ * extracted from it. One row per account (unique `account_id`); writes upsert via
+ * `INSERT OR REPLACE`.
+ *
+ * The `match` worker owns presence — written on matchmake/heartbeat, read by the
+ * heartbeat and the batch `/player` lookup. The `auth` worker seeds it for new
+ * players (Orientation) and the `rooms` worker reads it (Photon access token). All
+ * three import these helpers from `@repo/domain`; the `rooms` worker owns the
+ * schema (migrations/0006_presence.sql).
+ *
+ * This replaces the old match-presence KV. D1 gives strong reads (no cross-PoP
+ * staleness that would read presence as out-of-sync and bounce the player), a
+ * single-query batch lookup for `/player`, and lets matchmaking count players per
+ * instance (see {@link countPlayersInInstance}). Rows carry an absolute
+ * `expiresAt` (epoch seconds); reads filter expired rows out and
+ * {@link deleteExpiredPresence} purges them.
+ */
+
+import { bindPlaceholders, chunkForBinds } from './d1-binds'
+
+/** Presence is kept this long (s) after the last matchmake/heartbeat refresh. */
+export const PRESENCE_TTL_SECONDS = 900
+
+/**
+ * Game build version reported in presence (and echoed in the auth token's `rn.ver`
+ * claim). This is a server-side constant — the client doesn't supply it, and an
+ * empty value breaks the client's presence/version handling. Matches our target
+ * 2023 client build.
+ */
+export const GAME_VERSION = '20230414'
+
+/**
+ * The BUILD a client version names — the `YYYYMMDD` date of `20250718.01`, `20250718.2`
+ * or `20250718` alike — or null when there is nothing to name (no version, or an empty
+ * one). The `.NN` after the date is a same-day point release: it does not change the
+ * protocol, the scene format or anything else this server keys on, so every build gate
+ * compares builds, not versions, and a point release is served exactly as its date is.
+ *
+ * Versions are still carried VERBATIM where they describe the client to someone — the
+ * token's `rn.ver` and presence's `appVersion` echo what the client posted. Only the
+ * comparisons (and the room-instance key, see `room-instance-db`) go through here.
+ */
+export function gameBuild(version: string | null | undefined): string | null {
+	const build = version?.split('.')[0] ?? ''
+	return build === '' ? null : build
+}
+
+/**
+ * The DEFAULT set of client builds this server serves — what `/api/versioncheck/v4`
+ * answers "current" for and `auth` hands a token to when the operator has not set
+ * `SUPPORTED_GAME_VERSIONS` (see {@link supportedGameBuilds}). In the support tiers the
+ * README publishes; they talk close enough to the same protocol to get past the update
+ * prompt, and how much beyond that is tested differs by tier:
+ *
+ * - `GAME_VERSION` (`20230414`, manifest `7859140924515540835`) is the DEFAULT — the
+ *   build the rest of the stack targets and the one it reports for itself.
+ * - `20250718` (the `20250718.01` client, manifest `1151455856673601091`, reached through
+ *   the `patch-2025` patch) is BETA — supported, and the build the "newer than `20230414`"
+ *   gates in `econ`/`api`/`rooms` are written and tested against.
+ * - The rest are ALPHA: waved past the version check, but nothing else in the stack
+ *   targets them, so they can still hit protocol differences this check would otherwise
+ *   have caught. Expect breakage rather than treating a bug there as a regression.
+ *
+ * Listed WITHOUT the point release: a client reports `20250718.01`, `20250718.2` or
+ * `20250718` and all three are this build (see {@link gameBuild}). Keep the entries to the
+ * bare date — one with a `.NN` would match nothing.
+ */
+export const SUPPORTED_GAME_VERSIONS: string[] = [
+	GAME_VERSION, // default
+	'20250718', // beta (20250718.01)
+	'20230616', // alpha
+	'20231207', // alpha
+	'20250424', // alpha (20250424.01)
+	'20260323', // alpha (20260323.14), under staged rollout — see ROLLOUT_GAME_VERSIONS
+]
+
+/**
+ * The DEFAULT builds under STAGED ROLLOUT to Discord supporters, applied when the
+ * operator has not set `ROLLOUT_GAME_VERSIONS` (see {@link rolloutGameBuilds}). A build
+ * here is kept apart from the live side of the stack:
+ *
+ * - `auth` refuses `/connect/token` on one of these unless the account's Discord link
+ *   holds a role in `DISCORD_ROLLOUT_ROLE_IDS` (closed to everyone when none is set).
+ * - `match` hands `GET /player/connection-info` the `TACHYON_HOST_PORT_ROLLOUT` pool for a
+ *   caller whose token's `rn.ver` is one of these (a sandbox account keeps its sandbox
+ *   pool) — the new build runs against its own voice servers, apart from the live pool.
+ *
+ * One list so the two gates can't drift: a build is either rolling out or it isn't. A
+ * build under rollout is always SERVED (it is folded into {@link supportedGameBuilds}), it
+ * is just gated. Bare dates, like `SUPPORTED_GAME_VERSIONS`: every point release of a
+ * listed date is under rollout.
+ */
+export const ROLLOUT_GAME_VERSIONS: readonly string[] = [] // rollout ended: 20260323 is open to every account
+
+/**
+ * The two worker vars that override the lists above, both OPTIONAL and set for every
+ * worker at once from the root `.env` (`RECFLARE_SUPPORTED_GAME_VERSIONS`,
+ * `RECFLARE_ROLLOUT_GAME_VERSIONS` — see .env.example and `recflare_vars`). Each is a
+ * list of builds separated by commas (no whitespace survives the deploy script, but it is
+ * accepted), and either may be `off`/`none` for an EMPTY list. Entries are reduced to
+ * their build ({@link gameBuild}), so an operator who copies the client's `20250718.01`
+ * off a screen gets the same gate as `20250718`.
+ *
+ * A worker that reads either declares it in its context.ts and passes its env here;
+ * `auth`, `api` and `match` do. The lifecycle the knobs exist for:
+ *
+ * 1. ROLLOUT: both unset. The 2026 build is served to staff and Discord supporters only.
+ * 2. GENERAL AVAILABILITY: `ROLLOUT_GAME_VERSIONS=off`. The 2026 build is open to all.
+ * 3. FORCED UPGRADE: `SUPPORTED_GAME_VERSIONS=20230414,20260323` (and `off` as above). The
+ *    2025 build fails the version check and is refused a token, so it has to update.
+ *
+ * Or, to pull a rollout back entirely: `SUPPORTED_GAME_VERSIONS=20230414,20250718` with
+ * `ROLLOUT_GAME_VERSIONS=off` — the build is in neither list, so nobody reaches it.
+ */
+export interface GameVersionVars {
+	/** The served builds; unset means {@link SUPPORTED_GAME_VERSIONS}. */
+	SUPPORTED_GAME_VERSIONS?: string
+	/** The builds under staged rollout; unset means {@link ROLLOUT_GAME_VERSIONS}. */
+	ROLLOUT_GAME_VERSIONS?: string
+}
+
+/**
+ * A game-version var as a list of builds, or null when it is UNSET — absent, not a string
+ * (a var declared in wrangler.jsonc keeps its JSON type) or blank — so the caller applies
+ * its default. `off` or `none` (any case) is an EMPTY list, which is distinct from unset:
+ * it is how an operator empties a list that has a non-empty default. Entries are split on
+ * commas and/or whitespace, reduced to builds and de-duplicated; a lone `.NN` or an empty
+ * entry between two commas contributes nothing.
+ */
+export function parseGameBuilds(raw: unknown): string[] | null {
+	if (typeof raw !== 'string' || raw.trim() === '') return null
+	const trimmed = raw.trim()
+	if (/^(off|none)$/i.test(trimmed)) return []
+	const builds: string[] = []
+	for (const entry of trimmed.split(/[\s,]+/)) {
+		const build = gameBuild(entry)
+		if (build !== null && !builds.includes(build)) builds.push(build)
+	}
+	return builds
+}
+
+/** The builds under staged rollout: the operator's `ROLLOUT_GAME_VERSIONS`, or the default. */
+export function rolloutGameBuilds(env: GameVersionVars): string[] {
+	return parseGameBuilds(env.ROLLOUT_GAME_VERSIONS) ?? [...ROLLOUT_GAME_VERSIONS]
+}
+
+/**
+ * The builds this server serves: the operator's `SUPPORTED_GAME_VERSIONS` (or the default
+ * list) PLUS every build under rollout — a build being rolled out is being served, to
+ * whoever the rollout gate lets through, whether or not the operator also listed it.
+ */
+export function supportedGameBuilds(env: GameVersionVars): string[] {
+	const supported = parseGameBuilds(env.SUPPORTED_GAME_VERSIONS) ?? [...SUPPORTED_GAME_VERSIONS]
+	for (const build of rolloutGameBuilds(env)) {
+		if (!supported.includes(build)) supported.push(build)
+	}
+	return supported
+}
+
+/**
+ * Whether a client-supplied version (the version check's `?v=`, a grant's posted `ver`)
+ * names a build we serve. Compared as a build, so the client's point release never
+ * decides it. `builds` is {@link supportedGameBuilds} for a worker with the vars in hand;
+ * the default list otherwise.
+ */
+export function isSupportedGameVersion(
+	version: string | null | undefined,
+	builds: readonly string[] = SUPPORTED_GAME_VERSIONS
+): boolean {
+	const build = gameBuild(version)
+	return build !== null && builds.includes(build)
+}
+
+/**
+ * Whether a version (a token's `rn.ver`, a grant's posted `ver`) names a build under
+ * staged rollout. `builds` is {@link rolloutGameBuilds} for a worker with the vars in
+ * hand; the default list otherwise.
+ */
+export function isRolloutGameVersion(
+	version: string | null | undefined,
+	builds: readonly string[] = ROLLOUT_GAME_VERSIONS
+): boolean {
+	const build = gameBuild(version)
+	return build !== null && builds.includes(build)
+}
+
+/** Schema DDL (mirror of migrations/0006_presence.sql). */
+export const PRESENCE_SCHEMA_DDL: string[] = [
+	`CREATE TABLE IF NOT EXISTS presence (
+		data TEXT NOT NULL,
+		account_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.accountId')) VIRTUAL,
+		room_instance_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.roomInstance.roomInstanceId')) VIRTUAL,
+		room_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.roomInstance.roomId')) VIRTUAL,
+		expires_at INTEGER GENERATED ALWAYS AS (json_extract(data, '$.expiresAt')) VIRTUAL
+	)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_presence_account ON presence (account_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_presence_room_instance ON presence (room_instance_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_presence_expires ON presence (expires_at)`,
+]
+
+/**
+ * The presence a caller writes — the room instance the player is in plus the
+ * status fields the heartbeat echoes. Generic over the room-instance shape so each
+ * worker keeps its own typing (`match` its full instance, `rooms` just the id).
+ */
+export interface PresenceInput<TRoomInstance = unknown> {
+	accountId: number
+	roomInstance: TRoomInstance | null
+	statusVisibility: number
+	deviceClass: number
+	vrMovementMode: number
+	platform: number
+	appVersion: string
+	/**
+	 * The session's `LoginLock` GUID, bound from the form body at matchmake time. The
+	 * heartbeat posts it back purely to verify it still owns the session — a heartbeat
+	 * carrying a different lock is a superseded session and is rejected. Absent until a
+	 * matchmake supplies one.
+	 */
+	loginLock?: string
+}
+
+/** A stored presence row — the input plus its absolute expiry (epoch seconds). */
+export interface StoredPresence<TRoomInstance = unknown> extends PresenceInput<TRoomInstance> {
+	expiresAt: number
+}
+
+const nowSeconds = () => Math.floor(Date.now() / 1000)
+
+/**
+ * Upsert a player's presence, stamping a fresh absolute expiry (now +
+ * PRESENCE_TTL_SECONDS). One row per account: `INSERT OR REPLACE` resolves on the
+ * unique `account_id` index. Returns the stored row (with its new expiry).
+ */
+export async function setPresence<TRoomInstance>(
+	db: D1Database,
+	input: PresenceInput<TRoomInstance>
+): Promise<StoredPresence<TRoomInstance>> {
+	const stored: StoredPresence<TRoomInstance> = {
+		...input,
+		expiresAt: nowSeconds() + PRESENCE_TTL_SECONDS,
+	}
+	await db
+		.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+		.bind(JSON.stringify(stored))
+		.run()
+	return stored
+}
+
+/** Read a player's live presence, or null when they're absent or expired. */
+export async function getPresence<TRoomInstance>(
+	db: D1Database,
+	accountId: number,
+	now = nowSeconds()
+): Promise<StoredPresence<TRoomInstance> | null> {
+	const row = await db
+		.prepare('SELECT data FROM presence WHERE account_id = ?1 AND expires_at > ?2')
+		.bind(accountId, now)
+		.first<{ data: string }>()
+	return row ? (JSON.parse(row.data) as StoredPresence<TRoomInstance>) : null
+}
+
+/**
+ * Read many players' live presence in as few queries as D1 allows, keyed by account id (absent or
+ * expired players are simply missing from the map). Replaces the N point reads the
+ * batch `/player?id=…` lookup did against KV.
+ */
+export async function getPresences<TRoomInstance>(
+	db: D1Database,
+	accountIds: number[],
+	now = nowSeconds()
+): Promise<Map<number, StoredPresence<TRoomInstance>>> {
+	const out = new Map<number, StoredPresence<TRoomInstance>>()
+	if (accountIds.length === 0) return out
+	// The expiry cutoff spends one of the statement's binds, so each chunk of ids runs one
+	// short of the cap. A friends list is routinely longer than that; unchunked, it 500s.
+	const pages = await Promise.all(
+		chunkForBinds(accountIds, 1).map((chunk) =>
+			db
+				.prepare(
+					`SELECT data FROM presence
+					 WHERE account_id IN (${bindPlaceholders(chunk)}) AND expires_at > ?${chunk.length + 1}`
+				)
+				.bind(...chunk, now)
+				.all<{ data: string }>()
+		)
+	)
+	for (const r of pages.flatMap((page) => page.results)) {
+		const p = JSON.parse(r.data) as StoredPresence<TRoomInstance>
+		out.set(p.accountId, p)
+	}
+	return out
+}
+
+/**
+ * How many players are currently in a room instance — the live head-count
+ * matchmaking can use to spread players and avoid full instances (something KV
+ * couldn't answer without scanning every key). Counts only unexpired presence.
+ */
+export async function countPlayersInInstance(
+	db: D1Database,
+	roomInstanceId: number,
+	now = nowSeconds()
+): Promise<number> {
+	const row = await db
+		.prepare('SELECT COUNT(*) AS n FROM presence WHERE room_instance_id = ?1 AND expires_at > ?2')
+		.bind(roomInstanceId, now)
+		.first<{ n: number }>()
+	return row?.n ?? 0
+}
+
+/**
+ * WHO is standing in a room instance right now — the sibling of
+ * {@link countPlayersInInstance}, for when the answer has to be addressed rather than
+ * counted. The fan-out set for anything that happens in front of a room: a cheer plays its
+ * effect on every client in the instance, not just the two players involved.
+ *
+ * Reads only unexpired presence, so it is the LIVE occupancy — a player who crashed out
+ * drops off it when their row lapses. Ordered by account id for a stable result.
+ */
+export async function getPlayerIdsInInstance(
+	db: D1Database,
+	roomInstanceId: number,
+	now = nowSeconds()
+): Promise<number[]> {
+	const { results } = await db
+		.prepare(
+			`SELECT account_id AS accountId FROM presence
+			 WHERE room_instance_id = ?1 AND expires_at > ?2
+			 ORDER BY account_id`
+		)
+		.bind(roomInstanceId, now)
+		.all<{ accountId: number }>()
+	return results.map((r) => r.accountId)
+}
+
+/**
+ * Everyone standing in a ROOM right now, across all of its instances — the fan-out set for
+ * something that changes the room itself rather than one session of it, such as a role
+ * being accepted: every client in the room re-renders it, whichever instance they are in.
+ *
+ * The room-wide counterpart to {@link getPlayerIdsInInstance}, which is the narrower set
+ * for something that happens in front of one session (a cheer). Reads only unexpired
+ * presence, so it is LIVE occupancy — a player who crashed out drops off it when their row
+ * lapses — and excludes lobby (null-instance) presence. Ordered by account id, and DISTINCT:
+ * a stale row in another instance of the same room must not earn a second push.
+ */
+export async function getPlayerIdsInRoom(
+	db: D1Database,
+	roomId: number,
+	now = nowSeconds()
+): Promise<number[]> {
+	const { results } = await db
+		.prepare(
+			`SELECT DISTINCT account_id AS accountId FROM presence
+			 WHERE room_id = ?1 AND expires_at > ?2 AND room_instance_id IS NOT NULL
+			 ORDER BY account_id`
+		)
+		.bind(roomId, now)
+		.all<{ accountId: number }>()
+	return results.map((r) => r.accountId)
+}
+
+/**
+ * Everyone standing in one subroom of a room right now, across every live instance of
+ * that subroom. The narrower cut of {@link getPlayerIdsInRoom}: a room has several
+ * subrooms, and a player in a different subroom of the same room is not here.
+ *
+ * `subRoomId` is not its own column — presence indexes the room and the instance — so
+ * the subroom is read out of the instance blob. Unexpired presence only, lobby
+ * (null-instance) rows excluded, ordered by account id.
+ */
+export async function getPlayerIdsInRoomSubRoom(
+	db: D1Database,
+	roomId: number,
+	subRoomId: number,
+	now = nowSeconds()
+): Promise<number[]> {
+	const { results } = await db
+		.prepare(
+			`SELECT DISTINCT account_id AS accountId FROM presence
+			 WHERE room_id = ?1
+			   AND expires_at > ?2
+			   AND room_instance_id IS NOT NULL
+			   AND CAST(json_extract(data, '$.roomInstance.subRoomId') AS INTEGER) = ?3
+			 ORDER BY account_id`
+		)
+		.bind(roomId, now, subRoomId)
+		.all<{ accountId: number }>()
+	return results.map((r) => r.accountId)
+}
+
+/**
+ * Everyone online right now, anywhere — the same population {@link countOnlinePlayers}
+ * counts, as ids. Unexpired presence only, one row per account, lobby (null-instance)
+ * presence included: a player sat in a menu is as online as one in a room, and a gift to
+ * "everyone online" that skipped them would look to them like being skipped on purpose.
+ * Ordered so a pass over it is deterministic.
+ */
+export async function getOnlinePlayerIds(db: D1Database, now = nowSeconds()): Promise<number[]> {
+	const { results } = await db
+		.prepare(
+			`SELECT DISTINCT account_id AS accountId FROM presence
+			 WHERE expires_at > ?1
+			 ORDER BY account_id`
+		)
+		.bind(now)
+		.all<{ accountId: number }>()
+	return results.map((r) => r.accountId)
+}
+
+/**
+ * How many players are online right now, anywhere — one row per account, so this is
+ * the player count a status page means. Counts unexpired presence only: rows outlive
+ * the player by up to the TTL until the sweep purges them, and reads elsewhere ignore
+ * them the same way. Lobby (null-instance) presence IS counted — those players are
+ * signed in and playing, they're just not in a room.
+ */
+export async function countOnlinePlayers(db: D1Database, now = nowSeconds()): Promise<number> {
+	const row = await db
+		.prepare('SELECT COUNT(*) AS n FROM presence WHERE expires_at > ?1')
+		.bind(now)
+		.first<{ n: number }>()
+	return row?.n ?? 0
+}
+
+/**
+ * Live head-count per ROOM, keyed by room id — the players standing in any of a
+ * room's instances right now. One grouped query rather than a count per room, so
+ * feeds that rank by "who's playing" (the hot feed) stay a single read. Counts
+ * only unexpired presence; rooms nobody is in are simply absent from the map, and
+ * lobby (null-instance) presence is excluded.
+ */
+export async function countPlayersByRoom(
+	db: D1Database,
+	now = nowSeconds()
+): Promise<Map<number, number>> {
+	const { results } = await db
+		.prepare(
+			`SELECT room_id AS roomId, COUNT(*) AS n FROM presence
+			 WHERE expires_at > ?1 AND room_instance_id IS NOT NULL AND room_id IS NOT NULL
+			 GROUP BY room_id`
+		)
+		.bind(now)
+		.all<{ roomId: number; n: number }>()
+	return new Map(results.map((r) => [r.roomId, r.n]))
+}
+
+/**
+ * Who is standing in each of a room's instances right now, keyed by instance id —
+ * one grouped query rather than a lookup per instance, so the owner's instance list
+ * stays a single read. Reads only unexpired presence; instances nobody is in are
+ * simply absent from the map (callers default to an empty list), and lobby
+ * (null-instance) presence is excluded.
+ */
+export async function getPlayerIdsByRoomInstance(
+	db: D1Database,
+	roomId: number,
+	now = nowSeconds()
+): Promise<Map<number, number[]>> {
+	const { results } = await db
+		.prepare(
+			`SELECT room_instance_id AS instanceId, account_id AS accountId FROM presence
+			 WHERE room_id = ?1 AND expires_at > ?2 AND room_instance_id IS NOT NULL
+			 ORDER BY account_id`
+		)
+		.bind(roomId, now)
+		.all<{ instanceId: number; accountId: number }>()
+	const out = new Map<number, number[]>()
+	for (const r of results) {
+		const players = out.get(r.instanceId)
+		if (players) players.push(r.accountId)
+		else out.set(r.instanceId, [r.accountId])
+	}
+	return out
+}
+
+/**
+ * The room instances that expired presence rows still point at — the instances a
+ * player was in when they stopped heartbeating (a crash or a hard quit, where no
+ * matchmake ever moved them out). Their head-count has really dropped, so callers
+ * purging presence use this to recompute those instances' fullness. Distinct ids,
+ * lobby (null-instance) presence excluded.
+ */
+export async function getExpiredPresenceInstanceIds(
+	db: D1Database,
+	now = nowSeconds()
+): Promise<number[]> {
+	const { results } = await db
+		.prepare(
+			`SELECT DISTINCT room_instance_id AS id FROM presence
+			 WHERE expires_at <= ?1 AND room_instance_id IS NOT NULL`
+		)
+		.bind(now)
+		.all<{ id: number }>()
+	return results.map((r) => r.id)
+}
+
+/**
+ * The players whose presence rows have expired — the players about to be purged by
+ * {@link deleteExpiredPresence}. Read BEFORE the purge: once the rows are gone nothing
+ * remembers who lapsed, and their friends are owed the same offline
+ * SubscriptionUpdatePresence a logout sends (the lapse IS their logout, just one the
+ * client never got to post). Includes lobby (null-instance) presence — a player idle
+ * in the lobby who stops heartbeating has gone offline too.
+ */
+export async function getExpiredPresenceAccountIds(
+	db: D1Database,
+	now = nowSeconds()
+): Promise<number[]> {
+	const { results } = await db
+		.prepare('SELECT account_id AS id FROM presence WHERE expires_at <= ?1 ORDER BY account_id')
+		.bind(now)
+		.all<{ id: number }>()
+	return results.map((r) => r.id)
+}
+
+/**
+ * Purge expired presence rows — housekeeping only, since reads already ignore them
+ * (and `INSERT OR REPLACE` keeps a single row per account, so the table is bounded
+ * by account count). Returns the number of rows removed.
+ */
+export async function deleteExpiredPresence(db: D1Database, now = nowSeconds()): Promise<number> {
+	const res = await db.prepare('DELETE FROM presence WHERE expires_at <= ?1').bind(now).run()
+	return res.meta.changes ?? 0
+}
+
+/**
+ * Delete a single player's presence row — the player goes offline immediately
+ * (rather than waiting out the TTL). Used on logout. Returns rows removed (0 when
+ * they had no live presence). The caller is responsible for recomputing the
+ * fullness of the instance they were in.
+ */
+export async function deletePresence(db: D1Database, accountId: number): Promise<number> {
+	const res = await db.prepare('DELETE FROM presence WHERE account_id = ?1').bind(accountId).run()
+	return res.meta.changes ?? 0
+}

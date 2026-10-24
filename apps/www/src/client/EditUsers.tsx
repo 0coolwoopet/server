@@ -377,26 +377,27 @@ function UserEditor({
 			<section className="card">
 				<h2>Give all items and skins</h2>
 				<p className="hint">
-					Unlocks every avatar item and skin in the catalog for @{user.username}. Safe to press
-					again; nothing is doubled.
+					Unlocks every avatar item and skin in the catalog for @{user.username}, each one
+					delivered as a gift box. Pressing it again sends a fresh set of boxes.
 				</p>
-				{allItems.error && <p className="error">{allItems.error}</p>}
-				{allItems.done && <p className="ok">{allItems.done}</p>}
-				<button
-					type="button"
-					disabled={allItems.pending}
-					onClick={() => {
+				<form
+					onSubmit={(e) => {
+						e.preventDefault()
 						void allItems.run(async () => {
-							const res = await call<{ items: number; skins: number }>(
+							const res = await call<{ items: number; skins: number; boxes: number }>(
 								`/api/staff/players/${user.accountId}/give-all-items`,
 								{ authed: true, json: {} }
 							)
-							return `Gave @${user.username} ${res.items.toLocaleString()} items and ${res.skins.toLocaleString()} skins.`
+							return `Gave @${user.username} ${res.items.toLocaleString()} items and ${res.skins.toLocaleString()} skins as ${res.boxes.toLocaleString()} gift boxes.`
 						})
 					}}
 				>
-					{allItems.pending ? 'Giving…' : 'Give all items and skins'}
-				</button>
+					{allItems.error && <p className="error">{allItems.error}</p>}
+					{allItems.done && <p className="ok">{allItems.done}</p>}
+					<button type="submit" disabled={allItems.pending}>
+						{allItems.pending ? 'Giving…' : 'Give all items and skins'}
+					</button>
+				</form>
 			</section>
 		</>
 	)

@@ -1330,9 +1330,9 @@ async function findGiftableItem(db: D1Database, requested: string): Promise<Gift
 }
 
 /**
- * Give a player EVERY avatar item and skin in the catalog. Written straight into their
- * inventory (no gift boxes — thousands of them would bury the player), the same rows a
- * purchase makes, so re-running it is harmless: owned items are refreshed, not doubled.
+ * Give a player EVERY avatar item and skin in the catalog: written into their inventory,
+ * the same rows a purchase makes, plus one gift box per item and skin. Owned items are
+ * refreshed, not doubled, but every press adds a fresh set of boxes.
  * Needs the `catalog` table loaded (the deploy does that when it is empty).
  */
 export async function giveAllItemsHandler(c: Context<App>) {
@@ -1355,6 +1355,7 @@ export async function giveAllItemsHandler(c: Context<App>) {
 	}
 
 	const statements: D1PreparedStatement[] = []
+	const gifts: GiftContent[] = []
 	let items = 0
 	let skins = 0
 	for (const row of results) {
@@ -1365,6 +1366,16 @@ export async function giveAllItemsHandler(c: Context<App>) {
 					`INSERT INTO inventory (account_id, avatar_item_desc, data) VALUES (?1, ?2, ?3)
 					 ON CONFLICT (account_id, avatar_item_desc) DO UPDATE SET data = ?3`
 				).bind(playerId, item.AvatarItemDesc, JSON.stringify(item))
+			)
+			// ...and the box that shows it to them. AvatarItemType must be a number here (an avatar
+			// item's box fails to open without it), unlike a skin's, which is null.
+			gifts.push(
+				staffGiftContent({
+					GiftContext: GIFT_CONTEXT_PURCHASED_GIFT_A,
+					AvatarItemDesc: item.AvatarItemDesc,
+					AvatarItemType: item.AvatarItemType ?? 0,
+					GiftRarity: item.Rarity,
+				})
 			)
 			items++
 		} else {
@@ -1387,16 +1398,43 @@ export async function giveAllItemsHandler(c: Context<App>) {
 					     json(CASE WHEN json_extract(equipment.data, '$.Favorited') THEN 'true' ELSE 'false' END))`
 				).bind(playerId, equipment.ModificationGuid, JSON.stringify(equipment))
 			)
+			gifts.push(
+				staffGiftContent({
+					GiftContext: GIFT_CONTEXT_PURCHASED_GIFT_A,
+					EquipmentPrefabName: skin.PrefabName,
+					EquipmentModificationGuid: skin.ModificationGuid,
+					GiftRarity: skin.Rarity,
+				})
+			)
 			skins++
 		}
+	}
+	// One gift box per item and skin, in the same batches, so the player gets the usual box
+	// for each. (Pressing this again adds another box per item.)
+	const createdAt = new Date().toISOString()
+	for (const content of gifts) {
+		statements.push(
+			c.env.DB.prepare(
+				'INSERT INTO received_gift (account_id, data, created_at) VALUES (?1, ?2, ?3)'
+			).bind(playerId, JSON.stringify(content), createdAt)
+		)
 	}
 	for (let i = 0; i < statements.length; i += 100) {
 		await c.env.DB.batch(statements.slice(i, i + 100))
 	}
 
-	await recordPlayerAudit(c, 'give_all_items', { playerId, items, skins })
+	// Show the player one of the boxes now, if they are online, rather than thousands of
+	// frames; the rest are there when they open their gifts.
+	const last = await c.env.DB.prepare(
+		'SELECT id, data FROM received_gift WHERE account_id = ?1 ORDER BY id DESC LIMIT 1'
+	)
+		.bind(playerId)
+		.first<{ id: number; data: string }>()
+	if (last !== null) await announceGift(c, playerId, last.id, JSON.parse(last.data) as GiftContent)
+
+	await recordPlayerAudit(c, 'give_all_items', { playerId, items, skins, boxes: gifts.length })
 	logger.info('staff gave every item and skin', { moderatorId: staffId(c), playerId, items, skins })
-	return c.json({ items, skins })
+	return c.json({ items, skins, boxes: gifts.length })
 }
 
 /**
